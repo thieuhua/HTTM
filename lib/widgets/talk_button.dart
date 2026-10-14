@@ -12,32 +12,42 @@ class TalkButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Listener(
-      onPointerDown: (_) => controller.onTalkStart(),
-      onPointerUp: (_) => controller.onTalkEnd(),
-      child: StreamBuilder<bool>(
-        stream: controller.listening,
-        initialData: false,
-        builder: (context, snapshot) {
-          final isListening = snapshot.data ?? false;
-          return Container(
-            margin: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: isListening
-                  ? Colors.redAccent
-                  : Theme.of(context).colorScheme.primary,
-              borderRadius: BorderRadius.circular(24),
-            ),
-            alignment: Alignment.center,
-            child: Text(
-              isListening ? 'ĐANG NGHE...' : 'NHẤN GIỮ ĐỂ NÓI',
-              style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
+    return Semantics(
+      button: true,
+      label: 'Nhập lệnh bằng giọng nói',
+      hint:
+          'Nhấn giữ để nói; với trình đọc màn hình, kích hoạt để bắt đầu hoặc kết thúc.',
+      onTap: () => controller.isListening
+          ? controller.onTalkEnd()
+          : controller.onTalkStart(),
+      child: Listener(
+        onPointerDown: (_) => controller.onTalkStart(),
+        onPointerUp: (_) => controller.onTalkEnd(),
+        onPointerCancel: (_) => controller.onTalkEnd(),
+        child: StreamBuilder<bool>(
+          stream: controller.listening,
+          initialData: false,
+          builder: (context, snapshot) {
+            final isListening = snapshot.data ?? false;
+            return Container(
+              margin: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: isListening
+                    ? Colors.redAccent
+                    : Theme.of(context).colorScheme.primary,
+                borderRadius: BorderRadius.circular(24),
               ),
-            ),
-          );
-        },
+              alignment: Alignment.center,
+              child: Text(
+                isListening ? 'ĐANG NGHE...' : 'NHẤN GIỮ ĐỂ NÓI',
+                style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            );
+          },
+        ),
       ),
     );
   }

@@ -1,81 +1,83 @@
 import 'package:flutter/material.dart';
-
 import '../controllers/session_controller.dart';
 import '../models/route_progress.dart';
-import '../widgets/route_debug_map.dart';
+import '../widgets/navigation_map.dart';
 
-/// Dev/demo-only screen: visualizes route-following state (waypoint list,
-/// active step, real GPS position) that TTS alone doesn't make easy to
-/// verify. Reached from a button on [HomeScreen], never shown to the
-/// blind end user.
 class RouteDebugScreen extends StatelessWidget {
   const RouteDebugScreen({super.key, required this.controller});
-
   final SessionController controller;
-
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Route debug')),
-      body: StreamBuilder<RouteProgress>(
-        stream: controller.routeProgress,
-        builder: (context, snapshot) {
-          final progress = snapshot.data;
-          if (progress == null) {
-            return const Center(
-              child: Text('Chưa có dữ liệu route (chưa có GPS hoặc đích).'),
-            );
-          }
-          return Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              children: [
-                RouteDebugMap(progress: progress),
-                const SizedBox(height: 12),
-                Text(
-                  'Vị trí hiện tại: '
-                  '${progress.currentLat.toStringAsFixed(6)}, '
-                  '${progress.currentLng.toStringAsFixed(6)}  ·  '
-                  'còn ${progress.remainingMeters.round()} m tới bước kế tiếp',
-                  style: Theme.of(context).textTheme.bodySmall,
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(
+      title: const Text('Hành trình đi bộ'),
+      actions: [
+        IconButton(
+          tooltip: 'Xóa đoạn đường đã lưu',
+          icon: const Icon(Icons.delete_outline),
+          onPressed: () async {
+            final clear = await showDialog<bool>(
+              context: context,
+              builder: (context) => AlertDialog(
+                title: const Text('Xóa hành trình đã đi?'),
+                content: const Text(
+                  'Đường đi đã lưu trên thiết bị sẽ được xóa.',
                 ),
-                const SizedBox(height: 8),
-                Expanded(
-                  child: ListView.separated(
-                    itemCount: progress.waypoints.length,
-                    separatorBuilder: (_, _) => const Divider(height: 1),
-                    itemBuilder: (context, index) {
-                      final waypoint = progress.waypoints[index];
-                      final isCurrent = index == progress.currentIndex;
-                      final isDone = index < progress.currentIndex;
-                      return ListTile(
-                        leading: CircleAvatar(
-                          radius: 12,
-                          backgroundColor: isCurrent
-                              ? Colors.orangeAccent
-                              : (isDone ? Colors.greenAccent : null),
-                          child: Text('${index + 1}'),
-                        ),
-                        title: Text(
-                          waypoint.instruction,
-                          style: isCurrent
-                              ? const TextStyle(fontWeight: FontWeight.bold)
-                              : null,
-                        ),
-                        subtitle: Text(
-                          '${waypoint.distanceMeters.round()} m · '
-                          '${waypoint.lat.toStringAsFixed(5)}, '
-                          '${waypoint.lng.toStringAsFixed(5)}',
-                        ),
-                      );
-                    },
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('Hủy'),
+                  ),
+                  FilledButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child: const Text('Xóa'),
+                  ),
+                ],
+              ),
+            );
+            if (clear == true) await controller.clearJourney();
+          },
+        ),
+      ],
+    ),
+    body: StreamBuilder<RouteProgress>(
+      stream: controller.routeProgress,
+      initialData: controller.routeSnapshot,
+      builder: (_, snapshot) {
+        final p = snapshot.data!;
+        return Column(
+          children: [
+            Expanded(child: NavigationMap(progress: p)),
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Text(
+                '${p.message}\n${p.position == null ? 'Chưa có vị trí' : '${p.currentLat.toStringAsFixed(6)}, ${p.currentLng.toStringAsFixed(6)}'}'
+                ' · GPS ±${p.accuracyMeters?.round() ?? '—'} m\n'
+                'Đã đi ${p.walkedMeters.round()} m · Còn ${p.remainingMeters.round()} m\n'
+                'Cập nhật tuyến: ${p.lastRouteUpdate?.toLocal().toString().split('.').first ?? 'chưa có'}',
+              ),
+            ),
+            SizedBox(
+              height: 170,
+              child: ListView.builder(
+                itemCount: p.waypoints.length,
+                itemBuilder: (_, index) => ListTile(
+                  dense: true,
+                  leading: Icon(
+                    index < p.currentIndex
+                        ? Icons.check_circle
+                        : Icons.directions_walk,
+                    color: index == p.currentIndex ? Colors.orange : null,
+                  ),
+                  title: Text(p.waypoints[index].instruction),
+                  subtitle: Text(
+                    '${p.waypoints[index].distanceMeters.round()} m theo lối đi',
                   ),
                 ),
-              ],
+              ),
             ),
-          );
-        },
-      ),
-    );
-  }
+          ],
+        );
+      },
+    ),
+  );
 }

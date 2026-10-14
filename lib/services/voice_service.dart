@@ -11,8 +11,7 @@ class VoiceException implements Exception {
 }
 
 /// Thin wrapper around `speech_to_text` for the press-and-hold talk button.
-/// Recognition only — no intent/route handling exists yet, callers just show
-/// whatever text comes back.
+/// Recognition only; destination intent and confirmation belong to the session.
 class VoiceService {
   final SpeechToText _speech = SpeechToText();
   bool _initialized = false;
@@ -22,7 +21,12 @@ class VoiceService {
   Future<bool> initialize() async {
     if (_initialized) return true;
     _initialized = await _speech.initialize(
-      onError: (error) => _finalResultCompleter?.complete(null),
+      onError: (error) {
+        final completer = _finalResultCompleter;
+        if (completer != null && !completer.isCompleted) {
+          completer.complete(null);
+        }
+      },
     );
     return _initialized;
   }
@@ -45,9 +49,10 @@ class VoiceService {
         // called — stopListening() below waits for it instead of racing
         // ahead and reading whatever partial text happened to land first.
         if (result.finalResult) {
-          _finalResultCompleter?.complete(
-            _lastResult.isEmpty ? null : _lastResult,
-          );
+          final completer = _finalResultCompleter;
+          if (completer != null && !completer.isCompleted) {
+            completer.complete(_lastResult.isEmpty ? null : _lastResult);
+          }
         }
       },
       listenOptions: SpeechListenOptions(

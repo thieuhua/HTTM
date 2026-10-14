@@ -9,7 +9,14 @@ class CompassService {
     final events = FlutterCompass.events;
     if (events == null) return const Stream<double>.empty();
     return events
-        .where((event) => event.heading != null)
+        .where(
+          (event) =>
+              event.heading != null &&
+              event.heading!.isFinite &&
+              (event.accuracy == null ||
+                  event.accuracy! < 0 ||
+                  event.accuracy! <= 25),
+        )
         .map((event) => event.heading!);
   }
 }

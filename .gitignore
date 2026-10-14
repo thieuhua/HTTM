@@ -37,6 +37,7 @@ migrate_working_dir/
 ai_server/.venv/
 ai_server/__pycache__/
 ai_server/*.pt
+android/.kotlin/
 
 # Symbolication related
 app.*.symbols

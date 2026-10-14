@@ -1,21 +1,20 @@
-# AI Server
+# Smart Navigation server v2
 
-This service receives JPEG images and returns filtered YOLO detections. It uses
-`yolo11n.pt`, a small pretrained nano model. The weights download automatically
-on the first detection; run one test before the live demonstration.
+FastAPI + YOLO11n + Valhalla **pedestrian** + Nominatim search/reverse.
 
 ```powershell
-cd ai_server
-deactivate
-rmdir /s /q .venv
-py -3.11 -m venv .venv
-.venv\Scripts\activate
-python -m pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Open `http://127.0.0.1:8000/health` and expect `{"status":"ok"}`. Interactive
-API documentation is at `http://127.0.0.1:8000/docs`.
+Python 3.11 recommended. Health: `/health`; interactive API: `/docs`.
 
-To use another compatible model, set `YOLO_MODEL` before starting the server.
-The current danger value is only a bounding-box area heuristic—not depth.
+Routing: `/route?from_lat=&from_lng=&to_lat=&to_lng=`. Returns `profile=pedestrian`, geometry `[lat,lng]`, shape-indexed maneuvers, distance/time. Uses `VALHALLA_URL` (default `https://valhalla1.openstreetmap.de`); no driving fallback. Public service needs Internet; self-host for sustained production traffic.
+
+Geocoding: `/geocode?q=&near_lat=&near_lng=`; `/reverse?lat=&lng=`. Nominatim requests share a per-process 1.1-second interval and 5-minute bounded cache. Run one worker; multi-worker deployment needs shared throttling/cache.
+
+Detection: `/detect` multipart JPEG; model selected with `YOLO_MODEL`, confidence with `YOLO_CONFIDENCE`. Proximity remains a bounding-box heuristic.
+
+Tests: `.venv\Scripts\python.exe -X utf8 -B -m unittest discover -p "test_*.py" -v`.
+
+See [handoff](../docs/HANDOFF_PEDESTRIAN.md) for contract changes and phone validation.

@@ -8,6 +8,8 @@ import '../config/ai_config.dart';
 import '../models/detection_result.dart';
 import '../models/perception_frame.dart';
 import '../models/route_progress.dart';
+import '../models/placemark.dart';
+import '../models/geo_point.dart';
 import '../models/session_state.dart';
 import '../services/ai_detection_service.dart';
 import '../services/frame_source.dart';
@@ -17,7 +19,7 @@ import '../services/route_service.dart';
 import '../services/tts_service.dart';
 import '../services/voice_service.dart';
 
-/// Conductor tying the camera/YOLO perception loop, the GPS route heuristic,
+/// Conductor tying the camera/YOLO perception loop, pedestrian navigation,
 /// the talk button, and TTS output into one place the UI just observes.
 class SessionController {
   SessionController({
@@ -31,7 +33,7 @@ class SessionController {
   }) : _frameSource = frameSource ?? FrameSource(),
        _detectionService = detectionService ?? AiDetectionService(),
        _reasoningService = reasoningService ?? ObstacleReasoningService(),
-       _routeService = routeService ?? OsrmRouteService(),
+       _routeService = routeService ?? PedestrianRouteService(),
        _voiceService = voiceService ?? VoiceService(),
        _ttsService = ttsService ?? TtsService(),
        _geocodingService = geocodingService ?? GeocodingService();
@@ -62,38 +64,189 @@ class SessionController {
   bool _wasDangerous = false;
   RouteInstruction? _lastRoute;
   bool _isListening = false;
+  bool _disposed = false;
+  String? _lastRouteKey;
+  DateTime? _lastRouteSpokenAt;
+  DateTime? _obstacleUntil;
+  Timer? _routeSpeechTimer;
+  int _destinationRequest = 0;
+  String? cameraError;
+  Placemark? _pendingDestination;
+  String? currentAddress;
+  GeoPoint? _addressPosition;
+  bool _locatingAddress = false;
+  bool _navigationPaused = false;
+  Future<void>? _listeningStart;
 
   Stream<SessionState> get states => _stateController.stream;
   Stream<PerceptionFrame> get frames => _frameController.stream;
   Stream<bool> get listening => _listeningController.stream;
   Stream<RouteProgress> get routeProgress => _routeService.progress;
+  RouteProgress get routeSnapshot => _routeService.snapshot;
+  Placemark? get pendingDestination => _pendingDestination;
   CameraController? get cameraController => _frameSource.controller;
   bool get isRunning => _running;
 
   Future<void> initialize() async {
-    await _frameSource.initialize();
     await _ttsService.initialize();
     _routeSubscription = _routeService.instructions.listen((instruction) {
       _lastRoute = instruction;
+      if (!_wasDangerous &&
+          !_isListening &&
+          !_disposed &&
+          _pendingDestination == null) {
+        _stateController.add(SessionRunning(statusText: instruction.text));
+      }
+      unawaited(_speakRoute());
     });
-    _routeService.start();
-    // Demo default destination; a spoken "đi đến ..." command overrides it.
-    _routeService.setDestination(
-      AiConfig.demoDestinationLat,
-      AiConfig.demoDestinationLng,
+    _routeSpeechTimer = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => unawaited(_speakRoute()),
+    );
+    unawaited(_routeService.start());
+    try {
+      await _frameSource.initialize();
+    } catch (_) {
+      cameraError = 'Camera chưa sẵn sàng. Bản đồ và GPS vẫn hoạt động.';
+    }
+    if (_disposed) await _frameSource.dispose();
+  }
+
+  Future<void> _speakRoute({bool force = false}) async {
+    final instruction = _lastRoute;
+    final now = DateTime.now();
+    if (_disposed ||
+        instruction == null ||
+        _isListening ||
+        _pendingDestination != null ||
+        _navigationPaused ||
+        routeSnapshot.status == NavigationStatus.paused ||
+        (_obstacleUntil != null && now.isBefore(_obstacleUntil!))) {
+      return;
+    }
+    final since = _lastRouteSpokenAt == null
+        ? const Duration(days: 1)
+        : now.difference(_lastRouteSpokenAt!);
+    if (!force &&
+        (since < const Duration(seconds: 5) ||
+            (_lastRouteKey == instruction.key &&
+                since < const Duration(seconds: 25)))) {
+      return;
+    }
+    _lastRouteKey = instruction.key;
+    _lastRouteSpokenAt = now;
+    final spoken = await _ttsService.speak(instruction.text, priority: 1);
+    if (!spoken && _lastRouteSpokenAt == now) {
+      _lastRouteSpokenAt = null;
+      _lastRouteKey = null;
+    }
+  }
+
+  Future<void> repeatInstruction() => _speakRoute(force: true);
+  Future<void> refreshRoute() => _routeService.refresh();
+  Future<void> clearJourney() => _routeService.clearJourney();
+  void cancelDestination() {
+    ++_destinationRequest;
+    _pendingDestination = null;
+    _routeService.cancelDestination();
+  }
+
+  Future<void> resumeNavigation() {
+    _navigationPaused = false;
+    return _routeService.start();
+  }
+
+  void pauseNavigation() {
+    _navigationPaused = true;
+    unawaited(_ttsService.silence());
+    stop();
+    _routeService.stop();
+  }
+
+  Future<Placemark> findDestination(String query) async {
+    final position = routeSnapshot.position;
+    return _geocodingService.search(
+      query,
+      nearLat: position?.lat,
+      nearLng: position?.lng,
+    );
+  }
+
+  Future<bool> navigateTo(Placemark place) async {
+    ++_destinationRequest;
+    _pendingDestination = null;
+    _lastRouteKey = null;
+    return _routeService.setDestination(
+      place.lat,
+      place.lng,
+      name: place.displayName,
+    );
+  }
+
+  Future<void> confirmPendingDestination() async {
+    final place = _pendingDestination;
+    if (place != null) await navigateTo(place);
+  }
+
+  void cancelPendingDestination() {
+    _pendingDestination = null;
+    ++_destinationRequest;
+    _stateController.add(SessionRunning(statusText: routeSnapshot.message));
+  }
+
+  Future<void> describeLocation() async {
+    final progress = routeSnapshot;
+    if (progress.position == null) {
+      await _ttsService.speak(progress.message);
+      return;
+    }
+    if (progress.updatedAt == null ||
+        DateTime.now().difference(progress.updatedAt!) >
+            AiConfig.gpsStaleAfter ||
+        progress.status == NavigationStatus.poorGps) {
+      await _ttsService.speak(
+        'Vị trí GPS chưa đủ chính xác hoặc đã cũ. Hãy chờ GPS trước khi xác định vị trí.',
+      );
+      return;
+    }
+    if (!_locatingAddress &&
+        (_addressPosition == null ||
+            _addressPosition!.distanceTo(progress.position!) > 50)) {
+      _locatingAddress = true;
+      final address = await _geocodingService.reverse(
+        progress.currentLat,
+        progress.currentLng,
+      );
+      _locatingAddress = false;
+      if (_disposed) return;
+      currentAddress = address;
+      _addressPosition = progress.position;
+    }
+    final street = progress.streetName;
+    final heading = progress.headingDegrees;
+    await _ttsService.speak(
+      '${currentAddress == null ? (street.isEmpty ? 'Vị trí của bạn' : 'Bạn đang gần $street') : 'Bạn đang gần $currentAddress'}: '
+      'vĩ độ ${progress.currentLat.toStringAsFixed(5)}, kinh độ ${progress.currentLng.toStringAsFixed(5)}. '
+      '${heading == null ? 'Chưa có hướng la bàn.' : 'Điện thoại đang hướng ${cardinalDirection(heading)}.'} '
+      'Sai số GPS khoảng ${progress.accuracyMeters?.round() ?? 0} mét.',
     );
   }
 
   Future<bool> start() async {
-    if (_running || !_frameSource.isReady) return false;
+    if (_disposed || _navigationPaused || _running || !_frameSource.isReady) {
+      return false;
+    }
     final healthy = await _detectionService.isHealthy();
+    if (_disposed || _navigationPaused) return false;
     if (!healthy) {
+      cameraError = 'Không kết nối được AI vật cản. Kiểm tra AI Server.';
       _stateController.add(
         const SessionRunning(statusText: 'Không thể kết nối AI Server.'),
       );
       return false;
     }
     _running = true;
+    cameraError = null;
     _stateController.add(const SessionRunning(statusText: 'AI đang chạy'));
     _captureTimer = Timer.periodic(
       AiConfig.captureInterval,
@@ -118,6 +271,8 @@ class SessionController {
     try {
       image = await _frameSource.captureFrame();
       final result = await _detectionService.detect(image);
+      if (_disposed || !_running) return;
+      cameraError = null;
       final latencyMs = DateTime.now().difference(startedAt).inMilliseconds;
       final fps = latencyMs > 0 ? 1000 / latencyMs : 0.0;
       _frameController.add(
@@ -138,6 +293,7 @@ class SessionController {
       }
     } on AiDetectionException catch (error) {
       if (_running) {
+        cameraError = error.message;
         _stateController.add(SessionRunning(statusText: error.message));
       }
     } finally {
@@ -168,8 +324,8 @@ class SessionController {
           ),
         );
         if (shouldSpeakSafe) {
-          await _ttsService.speak('Phía trước an toàn.');
-          _lastSpokenWarning = 'Phía trước an toàn.';
+          await _ttsService.speak('Chưa phát hiện vật cản phía trước.');
+          _lastSpokenWarning = 'Chưa phát hiện vật cản phía trước.';
           _lastSpokenAt = DateTime.now();
           _lastSpokenDanger = null;
         }
@@ -179,6 +335,7 @@ class SessionController {
 
     _emptyCycles = 0;
     _wasDangerous = true;
+    _obstacleUntil = DateTime.now().add(const Duration(seconds: 5));
     final decisionSource = routeText == null
         ? 'Camera: ${_positionLabel(warning.object.position)} bị chắn'
         : 'Route: $routeText · Camera: ${_positionLabel(warning.object.position)} bị chắn';
@@ -205,7 +362,9 @@ class SessionController {
       } else if (warning.danger == DangerLevel.medium) {
         await HapticFeedback.mediumImpact();
       }
-      await _ttsService.speak(warning.text);
+      if (!_isListening) {
+        await _ttsService.speak(warning.text, priority: 3);
+      }
       _lastSpokenWarning = warning.text;
       _lastSpokenAt = now;
       _lastSpokenDanger = warning.danger;
@@ -219,8 +378,25 @@ class SessionController {
   };
 
   Future<void> onTalkStart() async {
+    if (_disposed || _isListening) return;
     _isListening = true;
     _listeningController.add(true);
+    try {
+      _listeningStart = _beginListening();
+      await _listeningStart;
+    } on VoiceException catch (error) {
+      _isListening = false;
+      _listeningController.add(false);
+      _stateController.add(SessionRunning(statusText: error.message));
+      await _ttsService.speak(error.message);
+    } finally {
+      _listeningStart = null;
+    }
+  }
+
+  Future<void> _beginListening() async {
+    await _ttsService.silence();
+    if (_disposed) return;
     await _voiceService.startListening(
       onResult: (text) {
         _stateController.add(SessionRunning(statusText: 'Đang nghe: $text'));
@@ -229,7 +405,16 @@ class SessionController {
   }
 
   Future<void> onTalkEnd() async {
+    if (_disposed) return;
+    try {
+      await _listeningStart;
+    } on VoiceException {
+      return;
+    }
+    if (_disposed) return;
+    final request = ++_destinationRequest;
     final text = await _voiceService.stopListening();
+    if (_disposed) return;
     _isListening = false;
     _listeningController.add(false);
     if (text == null || text.trim().isEmpty) {
@@ -240,6 +425,30 @@ class SessionController {
     }
 
     final destinationQuery = _destinationFrom(text);
+    final normalized = text.trim().toLowerCase();
+    if (_pendingDestination != null &&
+        ['xác nhận', 'đúng', 'đúng rồi', 'đồng ý'].contains(normalized)) {
+      final place = _pendingDestination!;
+      await navigateTo(place);
+      return;
+    }
+    if (['hủy', 'không', 'không đúng'].contains(normalized)) {
+      _pendingDestination = null;
+      await _ttsService.speak('Đã hủy địa điểm vừa tìm.');
+      return;
+    }
+    if (normalized.contains('tôi ở đâu') || normalized.contains('đang ở đâu')) {
+      await describeLocation();
+      return;
+    }
+    if (normalized == 'dừng dẫn đường' || normalized == 'hủy dẫn đường') {
+      cancelDestination();
+      return;
+    }
+    if (normalized == 'nhắc lại') {
+      await repeatInstruction();
+      return;
+    }
     if (destinationQuery == null) {
       _stateController.add(
         SessionRunning(
@@ -257,10 +466,15 @@ class SessionController {
       ),
     );
     try {
-      final place = await _geocodingService.search(destinationQuery);
-      _routeService.setDestination(place.lat, place.lng);
-      await _ttsService.speak('Đang tìm đường đến $destinationQuery.');
+      final place = await findDestination(destinationQuery);
+      if (_disposed || request != _destinationRequest) return;
+      _pendingDestination = place;
+      final confirmation =
+          'Địa điểm tìm được: ${place.displayName}. Nói “xác nhận” để dẫn đường, hoặc “hủy”.';
+      _stateController.add(SessionRunning(statusText: confirmation));
+      await _ttsService.speak(confirmation);
     } on GeocodingException catch (error) {
+      if (_disposed || request != _destinationRequest) return;
       await _ttsService.speak(error.message);
       _stateController.add(
         SessionRunning(
@@ -298,9 +512,13 @@ class SessionController {
   bool get isListening => _isListening;
 
   Future<void> dispose() async {
+    if (_disposed) return;
+    _disposed = true;
+    ++_destinationRequest;
+    _routeSpeechTimer?.cancel();
     _captureTimer?.cancel();
     await _routeSubscription?.cancel();
-    _routeService.dispose();
+    await _routeService.dispose();
     await _frameSource.dispose();
     _detectionService.dispose();
     _voiceService.dispose();

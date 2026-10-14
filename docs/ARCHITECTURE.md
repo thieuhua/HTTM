@@ -1,236 +1,57 @@
-# Kiến trúc hệ thống dẫn đường thông minh cho người khiếm thị
+# Kiến trúc dẫn đường đi bộ
 
-Tài liệu này tóm tắt kiến trúc mục tiêu của đề tài (dựa trên bản mô tả đầy đủ đã
-thống nhất) và đối chiếu với những gì thực sự đã có trong repo hiện tại, để làm
-rõ phần nào là **thật**, phần nào là **heuristic demo tạm thời**, và phần nào
-**chưa tồn tại**. Phần cuối là kế hoạch xây dựng theo giai đoạn cho các phần
-còn thiếu.
+Cập nhật 14/10/2026. Trạng thái triển khai và hướng dẫn bàn giao: [HANDOFF_PEDESTRIAN.md](HANDOFF_PEDESTRIAN.md).
 
-## 1. Bài toán và ý tưởng cốt lõi
+## Luồng dữ liệu
 
-Hệ thống giải hai bài toán chạy song song, hợp nhất tại một bộ điều phối:
-
-- **Dẫn đường** — người dùng cần đi đâu, hướng nào, khi nào rẽ (GPS + bản đồ +
-  routing + waypoint).
-- **Nhận thức môi trường** — phía trước có đi được không, có vật cản gì
-  (camera + depth + YOLO + walkable-area).
-
-Giao tiếp với người dùng là **voice-first + haptic**: nhập điểm đến bằng
-giọng nói (STT), phản hồi bằng câu lệnh ngắn (TTS) và rung cho tình huống khẩn
-cấp. Không có tương tác chạm/nhìn màn hình trên luồng chính.
-
-## 2. Kiến trúc mục tiêu (tổng thể)
-
-```
-                 NGƯỜI DÙNG
-                     │  "Đi đến ..."
-                     ▼
-              Speech-to-Text ──────► Geocoding (tìm địa điểm → tọa độ)
-                     │
-                     ▼
-              Route Planning (OSRM/GraphHopper trên server, dữ liệu OSM)
-                     │
-                     ▼
-                 Waypoint list
-                     │
-      ┌──────────────┴───────────────┐
-      ▼                              ▼
-  GPS Positioning              Camera + AI (Environmental AI)
-  (vị trí hiện tại)             Depth → Walkable Area → YOLO → Obstacle
-      │                              │
-      ▼                              ▼
-  Route Following               Obstacle Reasoner
-  (đúng hướng / sắp rẽ /             │
-   lệch tuyến)                      │
-      └──────────────┬───────────────┘
-                      ▼
-              Quyết định hành động
-        (tiếp tục waypoint | cảnh báo/né | re-route)
-                      │
-                ┌─────┴─────┐
-                ▼           ▼
-               TTS        Haptic
+```mermaid
+flowchart TD
+  GPS[GPS + độ chính xác + thời gian] --> Nav[PedestrianRouteService]
+  Compass[La bàn đầu điện thoại] --> Nav
+  Voice[Giọng nói / nhập địa điểm / chọn trên map] --> Session[SessionController]
+  Session --> Geo[Geocoding + xác nhận địa điểm]
+  Geo --> Nav
+  Nav --> Router[FastAPI /route → Valhalla pedestrian]
+  Router --> Shape[WalkingRoute: geometry + maneuver shape indices]
+  Shape --> Tracker[RouteTracker: chiếu GPS lên đường]
+  Tracker --> Nav
+  Nav --> Store[JourneyStore: vệt GPS đã đi riêng]
+  Nav --> Map[NavigationMap: OSM + GPS + hướng + tuyến còn lại]
+  Nav --> Session
+  Camera[Camera duy nhất → YOLO] --> Obstacle[ObstacleReasoningService]
+  Obstacle --> Session
+  Session --> TTS[TTS có ưu tiên + Haptic]
 ```
 
-Hai luồng dữ liệu độc lập (route vs. perception) được hợp nhất tại một
-**Navigation/Obstacle Reasoner** duy nhất — route cung cấp *mục tiêu*,
-perception quyết định *có an toàn để thực hiện mục tiêu đó không*.
+## Các ranh giới
 
-## 3. Ngăn xếp công nghệ mục tiêu
+- `LocationSource`: GPS thật hoặc nguồn fake trong test; kiểm tra quyền, dịch vụ vị trí, stream và fix hiện tại.
+- `CompassService`: hướng đầu thiết bị và lọc độ chính xác; navigation làm mượt góc và hết hạn dữ liệu cũ.
+- `WalkingRoute`: geometry `[lat,lng]`, khoảng cách tích lũy và các maneuver gắn với chỉ số shape. Client từ chối route ô tô hoặc API cũ thiếu geometry.
+- `RouteTracker`: phép chiếu trên segment và cửa sổ tiến độ, khoảng cách ngang tuyến, điểm nhìn trước và cắt phần đường còn lại.
+- `PedestrianRouteService`: state machine `locating/idle/planning/navigating/offRoute/poorGps/arrived/error/paused`; định kỳ tính lại đường tới đích từ GPS mới; kiểm soát response cũ bằng generation.
+- `JourneyStore`: vệt thực tế, khoảng cách đã đi, ranh giới đoạn và đích còn dở; không ghi đè vệt khi thay tuyến.
+- `SessionController`: điều phối voice, route và perception; route không phụ thuộc camera hoạt động. TTS cảnh báo có ưu tiên hơn chỉ dẫn tuyến.
+- `NavigationMap`: nền OSM, vị trí thật, vòng sai số, mũi tên đầu điện thoại, hướng lối đi, vệt đã đi, tuyến còn lại và marker đích.
 
-| Nhóm | Công nghệ | Vai trò |
-|---|---|---|
-| Mobile | Flutter | Ứng dụng client |
-| Camera | `camera` plugin | Thu hình |
-| Depth | MiDaS Small / Depth Anything V2 Small | Ước lượng độ sâu |
-| Detection | YOLO (hiện: `yolo11n.pt` qua `ai_server`; mục tiêu: YOLO26n) | Nhận dạng vật cản |
-| Walkable area | Gradient + Normal Vector trên Depth Map | Vùng đi được |
-| Vị trí | GPS (`geolocator`) | Vị trí hiện tại |
-| Hướng | La bàn/từ kế (`flutter_compass`) | Hướng thiết bị đang chỉ — hoạt động cả khi đứng yên |
-| Bản đồ | OpenStreetMap | Dữ liệu đường/vỉa hè |
-| Routing | OSRM / GraphHopper | Tính tuyến đường |
-| Voice input | `speech_to_text` | Nhập điểm đến |
-| Voice output | `flutter_tts` | Hướng dẫn |
-| Haptic | `HapticFeedback` / `vibration` | Cảnh báo khẩn |
-| Giao tiếp | HTTP (nay) / WebSocket (khi cần real-time hai chiều) | App ↔ server |
-| On-device (tương lai) | TensorFlow Lite (INT8) | Suy luận offline |
+## Tiến độ thích ứng
 
-## 4. Trạng thái hiện tại trong repo — cái gì thật, cái gì là stub
+Maneuver vẫn cần tồn tại để biết nơi rẽ, nhưng tiến độ không dựa vào một bán kính waypoint cố định. GPS được chiếu lên đường; maneuver nào đã qua được xác định bằng khoảng cách dọc polyline. Khoảng cách hướng dẫn cũng tính dọc đường, không lấy đường chim bay tới điểm rẽ.
 
-### 4.1. Đã hoạt động thật
+Ngưỡng vẫn cần để xử lý độ không chắc chắn: lọc GPS, xác nhận lệch tuyến và đến đích. Các ngưỡng này gắn với accuracy, tốc độ hoặc số fix liên tiếp, không đóng vai trò cơ chế chuyển waypoint.
 
-| Thành phần | File | Ghi chú |
-|---|---|---|
-| Camera capture dùng chung 1 stream | [lib/services/frame_source.dart](../lib/services/frame_source.dart) | Không mở 2 stream camera |
-| Object Detection (YOLO thật, chạy trên server) | [ai_server/detector.py](../ai_server/detector.py), [lib/services/ai_detection_service.dart](../lib/services/ai_detection_service.dart) | `yolo11n.pt`, lọc theo `OBSTACLE_CLASSES` |
-| Spatial reasoning trái/giữa/phải + chọn cảnh báo ưu tiên | [lib/services/obstacle_reasoning_service.dart](../lib/services/obstacle_reasoning_service.dart) | Đúng thuật toán #7 (Spatial Reasoning) ở mức object, chưa ở mức walkable-area |
-| Temporal debouncing cảnh báo (cooldown 3s + safe-cycle) | [lib/controllers/session_controller.dart](../lib/controllers/session_controller.dart) | Thuật toán #10, đơn giản (cooldown cố định, chưa theo mức nguy hiểm biến thiên) |
-| TTS + Haptic theo mức nguy hiểm | [lib/services/tts_service.dart](../lib/services/tts_service.dart), `session_controller.dart` | Rung mạnh/vừa theo `DangerLevel` |
-| GPS Positioning thật | [lib/services/route_service.dart](../lib/services/route_service.dart) | `Geolocator.getPositionStream` |
-| La bàn thật (hướng thiết bị đang chỉ) | [lib/services/compass_service.dart](../lib/services/compass_service.dart) | `flutter_compass` — đọc trực tiếp từ, hoạt động cả khi đang đứng yên, không như `Position.heading` của GPS (chỉ có khi đang di chuyển) |
-| Speech-to-Text thật (ghi nhận văn bản) | [lib/services/voice_service.dart](../lib/services/voice_service.dart) | Trả text; đã nối sang geocoding (xem Giai đoạn A) |
-| Cấu hình qua `.env` | [lib/config/ai_config.dart](../lib/config/ai_config.dart), `pubspec.yaml` | `flutter_dotenv` |
-| Geocoding thật (giọng nói → tọa độ) | [ai_server/geocoder.py](../ai_server/geocoder.py) (`/geocode`, proxy Nominatim), [lib/services/geocoding_service.dart](../lib/services/geocoding_service.dart), [lib/models/placemark.dart](../lib/models/placemark.dart) | `SessionController.onTalkEnd` tách tiền tố ý định ("đi đến", "dẫn tôi tới", ...) rồi geocode và gọi `RouteService.setDestination` |
-| Route Planning + Waypoint thật (OSRM) | [ai_server/routing.py](../ai_server/routing.py) (`/route`), [lib/services/route_planning_service.dart](../lib/services/route_planning_service.dart), [lib/models/waypoint.dart](../lib/models/waypoint.dart) | Route thật theo đường (profile `driving` trên OSRM demo — chưa có profile đi bộ, xem giới hạn ở mục 4.2) |
-| Route Following thật | `OsrmRouteService` trong [lib/services/route_service.dart](../lib/services/route_service.dart) | So khoảng cách GPS thật tới từng waypoint để tự chuyển sang hướng dẫn kế tiếp, phát "Sắp ..." khi gần điểm rẽ, "Đã đến nơi" ở waypoint cuối |
-| Màn hình debug trực quan cho route | [lib/screens/route_debug_screen.dart](../lib/screens/route_debug_screen.dart), [lib/widgets/route_debug_map.dart](../lib/widgets/route_debug_map.dart), [lib/models/route_progress.dart](../lib/models/route_progress.dart) | Sơ đồ waypoint chiếu từ lat/lng (không phải bản đồ thật), danh sách waypoint đánh dấu bước hiện tại, vị trí GPS thật — mở từ icon route trên `HomeScreen`, không hiển thị cho người dùng khiếm thị |
+Tuyến được kiểm tra mỗi 5 giây, cập nhật sau 30 giây nếu đã di chuyển >=5 m, hoặc sớm khi lệch tuyến được xác nhận. Chỉ cập nhật đường phía trước, không thay lịch sử đã đi. Không gọi đồng thời các refresh cho cùng đích; thay đích hủy hiệu lực kết quả cũ.
 
-### 4.2. Heuristic demo — có thật một phần, chưa đúng bản chất kiến trúc
+## Hợp đồng server v2
 
-| Thành phần | File | Giới hạn hiện tại |
-|---|---|---|
-| "Depth"/mức nguy hiểm | [ai_server/detector.py](../ai_server/detector.py) `danger_for()` | Suy ra từ **diện tích bounding box**, không phải Depth Map thật (không có Monocular Depth Estimation) |
-| "Route" theo profile ô tô, chưa phải đi bộ | `OsrmRouteService` trong [route_service.dart](../lib/services/route_service.dart) | Waypoint/turn-by-turn là thật (qua OSRM), nhưng OSRM demo server public chỉ có profile `driving` (đi theo đường xe, không phải vỉa hè) — xem comment đầu [ai_server/routing.py](../ai_server/routing.py). `GeolocatorRouteService` (bearing-tới-1-điểm) vẫn được giữ làm fallback không cần mạng/OSRM |
-| Voice → điểm đến | `voice_service.dart` + `SessionController.onTalkEnd` | Hiển thị text nhận dạng được ở dòng phụ, **không** geocode, **không** đặt làm đích cho `RouteService` |
+- `GET /health`: health, routing profile, API version.
+- `POST /detect`: YOLO như trước.
+- `GET /geocode?q=&near_lat=&near_lng=`: địa điểm ưu tiên vùng hiện tại, chờ người dùng xác nhận.
+- `GET /reverse?lat=&lng=`: địa chỉ gần vị trí theo yêu cầu.
+- `GET /route?from_lat=&from_lng=&to_lat=&to_lng=`: Valhalla pedestrian, geometry và maneuvers đầy đủ.
 
-### 4.3. Chưa tồn tại
+`VALHALLA_URL` cấu hình server; `AI_SERVER_URL` cấu hình Flutter, ưu tiên dart-define rồi `.env`. Chạy Nominatim proxy một worker để giữ rate limit trong process.
 
-- Monocular Depth Estimation (MiDaS/Depth Anything V2 Small) + Depth Map: không có.
-- Walkable Area Detection từ gradient/normal vector: không có — mức nguy hiểm hiện suy từ diện tích box.
-- Kết hợp Route ↔ Obstacle Reasoner để **chủ động đổi hành vi route** (ví dụ: route bảo đi thẳng nhưng camera thấy chắn hết vỉa hè → gợi ý né trái/phải): hiện `SessionController` chỉ **hiển thị song song** hai dòng "Route: ... · Camera: ..." chứ chưa có logic quyết định.
-- Re-routing (phát hiện lệch tuyến hoặc route không còn khả thi → tính lại route hoặc né cục bộ): không có.
-- Backend routing/geocoding trên `ai_server` (hiện `ai_server` chỉ có `/health` và `/detect`): không có.
-- TensorFlow Lite / on-device inference: không có (mọi suy luận AI đang qua HTTP tới `ai_server`).
+## Giới hạn được giữ rõ
 
-## 5. Kế hoạch xây dựng các phần còn thiếu
-
-Thứ tự ưu tiên theo giá trị demo/tốt nghiệp: từ "nói ra được điểm đến và có
-route thật" → "route theo waypoint thật" → "kết hợp route với vật cản" →
-"depth/walkable-area thật" → "re-routing" → "on-device". Mỗi giai đoạn giữ
-nguyên các phần đã có, chỉ thay thế heuristic bằng thành phần thật.
-
-### Giai đoạn A — Geocoding: giọng nói → tọa độ đích thật ✅ Đã triển khai
-- `ai_server/geocoder.py` + endpoint `GET /geocode?q=...` trong
-  [ai_server/main.py](../ai_server/main.py): proxy Nominatim OSM (đặt
-  `User-Agent` đúng usage policy), trả `{success, lat, lng, display_name}`.
-  Chưa có cache/rate-limit — cần thêm nếu demo gọi nhiều lần liên tục
-  (Nominatim public giới hạn ~1 req/s).
-- [lib/services/geocoding_service.dart](../lib/services/geocoding_service.dart) +
-  [lib/models/placemark.dart](../lib/models/placemark.dart): gọi `/geocode`,
-  trả `Placemark {lat, lng, displayName}`.
-- `RouteService`/`GeolocatorRouteService` trong
-  [lib/services/route_service.dart](../lib/services/route_service.dart) có
-  thêm `void setDestination(lat, lng)`.
-- `SessionController.onTalkEnd` ([lib/controllers/session_controller.dart](../lib/controllers/session_controller.dart)):
-  tách tiền tố ý định ("đi đến", "dẫn tôi tới", "đưa tôi đến", ...) khỏi câu
-  nói được; nếu khớp, geocode phần còn lại → `RouteService.setDestination` →
-  TTS xác nhận `"Đang tìm đường đến ..."`; nếu không tìm thấy địa điểm, TTS
-  đọc lý do lỗi.
-- Còn thiếu để hoàn chỉnh: nhận diện ý định bằng NLU thật thay cho so khớp
-  tiền tố cứng; xác nhận lại địa điểm với người dùng trước khi đặt làm đích
-  (hiện đặt đích ngay khi geocode thành công).
-
-### Giai đoạn B — Route Planning + Waypoint thật ✅ Đã triển khai
-- `ai_server/routing.py` + endpoint `GET /route?from_lat=&from_lng=&to_lat=&to_lng=`
-  trong [main.py](../ai_server/main.py): proxy OSRM demo server công khai
-  (`router.project-osrm.org`, profile `driving` — public demo không còn phục
-  vụ profile đi bộ), dịch `maneuver.type/modifier` sang câu tiếng Việt ngắn
-  ("Rẽ trái", "Đi thẳng", "Đã đến nơi", ...), trả `List<Waypoint>`.
-- [lib/models/waypoint.dart](../lib/models/waypoint.dart) +
-  [lib/services/route_planning_service.dart](../lib/services/route_planning_service.dart):
-  gọi `/route`, parse JSON.
-- `OsrmRouteService implements RouteService` trong
-  [lib/services/route_service.dart](../lib/services/route_service.dart):
-  **Route Following thật** (thuật toán #8) — theo dõi `Geolocator.getPositionStream`,
-  so khoảng cách GPS thật tới toạ độ waypoint kế tiếp; khi < 15 m thì coi là
-  đã tới và chuyển sang chỉ dẫn của waypoint đó; khi còn ≤ 20 m thì phát
-  trước "chỉ dẫn kế tiếp sau N m" (giống ví dụ "Sắp đến giao lộ." trong bản
-  thiết kế); ở waypoint cuối phát "Đã đến nơi". `GeolocatorRouteService`
-  (heuristic bearing-tới-1-điểm) được giữ nguyên làm lựa chọn thay thế không
-  cần OSRM/mạng.
-- `SessionController` đổi implementation mặc định sang `OsrmRouteService`
-  và gọi `setDestination` với điểm đến demo ngay từ `initialize()`, để luôn
-  có 1 tuyến chạy sẵn trước khi người dùng nói — nói "đi đến ..." sẽ gọi lại
-  `setDestination` với điểm đến mới (đã nối ở Giai đoạn A).
-- **Sửa lỗ hổng "đứng một chỗ không biết đi hướng nào"**: bản đầu chỉ dùng
-  `Position.heading` (hướng di chuyển suy từ GPS) để quyết định trái/phải,
-  nhưng giá trị này chỉ có khi **đang di chuyển** — lúc đứng yên nó là
-  `NaN` và code cũ mặc định trả về "Đi thẳng", tức là sai/im lặng đúng vào
-  lúc người dùng cần hướng dẫn nhất. [lib/services/compass_service.dart](../lib/services/compass_service.dart)
-  đọc la bàn thật (từ kế) qua `flutter_compass`, có giá trị ngay cả khi
-  đứng yên. Hàm `facingInstruction()` trong
-  [lib/services/route_service.dart](../lib/services/route_service.dart) so
-  hướng la bàn với bearing tới waypoint kế tiếp để trả về "Đi thẳng / Quay
-  sang trái / Quay sang phải / Quay lại" — cả `GeolocatorRouteService` và
-  `OsrmRouteService` đều dùng hàm này, tính lại mỗi khi có sự kiện la bàn
-  mới (không chỉ khi có GPS mới), nên vừa đặt xong đích là có hướng dẫn
-  ngay, không cần bước đi trước.
-- Còn thiếu để hoàn chỉnh: chưa có state `offRoute` tường minh (chỉ có
-  `onTrack`/`approachingTurn`/`arrived` qua khoảng cách tới waypoint kế
-  tiếp) — việc phát hiện lệch tuyến và re-route thật để ở Giai đoạn E; chưa
-  self-host OSRM với profile đi bộ nên tuyến vẫn đi theo đường ô tô; la bàn
-  điện thoại có thể bị nhiễu từ trường gần kim loại/điện tử nên hướng dẫn
-  "quay sang trái/phải" có thể sai lệch cục bộ — chưa có bước calibrate.
-
-### Giai đoạn C — Kết hợp Route và Obstacle Reasoner (Decision Fusion)
-- Trong `SessionController`, thay việc chỉ nối 2 dòng text bằng một hàm quyết
-  định: nếu `ObstacleReasoningService` báo nguy hiểm ở đúng hướng route đang
-  yêu cầu → tạm ngắt câu route, phát cảnh báo vật cản trước, sau đó nếu
-  perception cho biết bên trái/phải trống → gợi ý né trước khi tiếp tục đọc
-  waypoint.
-- Đây là chỗ hiện đã có khung sườn (`_processResult` gộp `routeText` +
-  `warning`), chỉ cần nâng cấp từ "hiển thị song song" lên "logic điều
-  hướng ưu tiên".
-- Tiêu chí xong: mô phỏng vật cản chắn hướng route → nghe cảnh báo trước khi
-  nghe tiếp hướng dẫn route.
-
-### Giai đoạn D — Depth Estimation + Walkable Area (thay `danger_for()` theo diện tích)
-- Trên `ai_server`: thêm model MiDaS Small hoặc Depth Anything V2 Small,
-  endpoint mới `/depth` (hoặc gộp vào `/detect` trả thêm `depth_map`/
-  `walkable_mask`).
-- Thuật toán: Depth Map → gradient → normal vector → phân loại
-  walkable/non-walkable theo mặt phẳng (mục 7 trong bản thiết kế) — độc lập
-  với YOLO, để vật cản không thuộc `OBSTACLE_CLASSES` vẫn được phát hiện.
-- YOLO giữ vai trò bổ sung ngữ nghĩa (mục 8): sau khi Depth Analysis báo "có
-  vật cản", chạy YOLO lên vùng đó để suy ra tên vật cản, giữ nguyên
-  `ObstacleReasoningService` hiện tại làm bước cuối.
-- Tiêu chí xong: vật cản lạ (không có trong `OBSTACLE_CLASSES`) vẫn được cảnh
-  báo nhờ walkable-area, không chỉ nhờ YOLO.
-
-### Giai đoạn E — Re-routing
-- `RouteFollower` phát sự kiện `offRoute` hoặc `SessionController` phát hiện
-  cảnh báo vật cản lặp lại nhiều cycle liên tiếp trên toàn bộ chiều rộng khung
-  hình → gọi lại `/route` từ vị trí hiện tại, hoặc áp dụng né cục bộ (giữ
-  hướng đi theo waypoint tiếp theo nhưng lệch trái/phải theo vùng walkable
-  trống).
-- Tiêu chí xong: giữ thiết bị cố ý lệch khỏi waypoint → nghe
-  `"Bạn đã đi lệch khỏi tuyến đường"` rồi route tự tính lại.
-
-### Giai đoạn F — On-device (TensorFlow Lite)
-- Không bắt buộc cho MVP; chỉ nên làm sau khi giai đoạn D ổn định. Mục tiêu:
-  chuyển YOLO + depth model nhẹ sang chạy trực tiếp trên điện thoại bằng
-  `tflite_flutter`, giảm phụ thuộc mạng/độ trễ cho phần an toàn (Environmental
-  AI), giữ routing/geocoding trên server vì cần dữ liệu bản đồ lớn — đúng
-  triết lý Edge–Server đã đặt ra.
-
-## 6. Ghi chú thiết kế cần giữ nguyên khi mở rộng
-
-- Một `CameraController`/một `FrameSource` duy nhất cho preview và pipeline AI
-  — không tạo stream camera thứ hai khi thêm depth model.
-- `SessionController` là nơi duy nhất hợp nhất route + perception + voice;
-  UI (`HomeScreen`, `StatusPanel`, `PerceptionPreview`, `TalkButton`) chỉ
-  quan sát stream, không chứa logic quyết định.
-- Giữ interface `RouteService` khi thêm `OsrmRouteService` — cho phép chạy
-  song song bản heuristic GPS (demo không cần mạng) và bản OSRM thật bằng
-  cách đổi implementation tại nơi khởi tạo `SessionController` trong
-  [lib/main.dart](../lib/main.dart), không đổi phần còn lại của app.
+La bàn là hướng đầu điện thoại, không phải hướng cơ thể. Map matching cục bộ không xác định được bên vỉa hè hoặc tầng trong nhà. Đi bộ theo dữ liệu OSM chưa chứng minh tuyến an toàn/tiếp cận cho người khiếm thị. Camera dùng bbox heuristic, chưa có depth, walkable-area hoặc tránh/sang đường tự động. App chưa dẫn đường khi khóa màn hình. Các bước xác minh và tiếp tục được liệt kê trong handoff.

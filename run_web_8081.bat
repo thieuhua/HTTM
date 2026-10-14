@@ -1,0 +1,6 @@
+@echo off
+cd E:\thieuh\FolderCode\Flutter\HTTM\ai_server
+call .venv\Scripts\activate
+python -m pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8001
+pause

@@ -21,11 +21,19 @@ class GeocodingService {
 
   final http.Client _client;
 
-  Future<Placemark> search(String query) async {
+  Future<Placemark> search(
+    String query, {
+    double? nearLat,
+    double? nearLng,
+  }) async {
     try {
-      final uri = Uri.parse(
-        '${AiConfig.serverUrl}/geocode',
-      ).replace(queryParameters: {'q': query});
+      final uri = Uri.parse('${AiConfig.serverUrl}/geocode').replace(
+        queryParameters: {
+          'q': query,
+          if (nearLat != null && nearLng != null) 'near_lat': '$nearLat',
+          if (nearLat != null && nearLng != null) 'near_lng': '$nearLng',
+        },
+      );
       final response = await _client.get(uri).timeout(AiConfig.requestTimeout);
       if (response.statusCode != 200) {
         developer.log(
@@ -48,4 +56,18 @@ class GeocodingService {
   }
 
   void dispose() => _client.close();
+
+  Future<String?> reverse(double lat, double lng) async {
+    try {
+      final uri = Uri.parse(
+        '${AiConfig.serverUrl}/reverse',
+      ).replace(queryParameters: {'lat': '$lat', 'lng': '$lng'});
+      final response = await _client.get(uri).timeout(AiConfig.requestTimeout);
+      if (response.statusCode != 200) return null;
+      final body = jsonDecode(response.body) as Map<String, dynamic>;
+      return body['success'] == true ? body['display_name'] as String? : null;
+    } catch (_) {
+      return null;
+    }
+  }
 }

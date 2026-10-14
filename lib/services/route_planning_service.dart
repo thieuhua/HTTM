@@ -4,7 +4,7 @@ import 'dart:developer' as developer;
 import 'package:http/http.dart' as http;
 
 import '../config/ai_config.dart';
-import '../models/waypoint.dart';
+import '../models/walking_route.dart';
 
 class RoutePlanningException implements Exception {
   const RoutePlanningException(this.message);
@@ -15,13 +15,14 @@ class RoutePlanningException implements Exception {
 }
 
 /// Fetches a real turn-by-turn route from `ai_server`'s `/route` proxy
-/// (OSRM). See [ai_server/routing.py] for the profile/limitations.
+/// (Valhalla pedestrian). Rejects older waypoint-only/driving responses.
 class RoutePlanningService {
-  RoutePlanningService({http.Client? client}) : _client = client ?? http.Client();
+  RoutePlanningService({http.Client? client})
+    : _client = client ?? http.Client();
 
   final http.Client _client;
 
-  Future<List<Waypoint>> plan({
+  Future<WalkingRoute> plan({
     required double fromLat,
     required double fromLng,
     required double toLat,
@@ -49,14 +50,12 @@ class RoutePlanningService {
       if (decoded is! Map<String, dynamic> || decoded['success'] != true) {
         throw const FormatException('Invalid route response.');
       }
-      final rawWaypoints = decoded['waypoints'];
-      if (rawWaypoints is! List || rawWaypoints.isEmpty) {
-        throw const RoutePlanningException('Tuyến đường trống.');
+      if (decoded['profile'] != 'pedestrian' || decoded['geometry'] is! List) {
+        throw const RoutePlanningException(
+          'Server chưa hỗ trợ tuyến đi bộ có bản đồ. Hãy cập nhật AI Server.',
+        );
       }
-      return rawWaypoints
-          .whereType<Map<String, dynamic>>()
-          .map(Waypoint.fromJson)
-          .toList(growable: false);
+      return WalkingRoute.fromJson(decoded);
     } on RoutePlanningException {
       rethrow;
     } catch (_) {
