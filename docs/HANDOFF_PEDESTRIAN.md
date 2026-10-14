@@ -1,5 +1,7 @@
 # Handoff: dẫn đường đi bộ — 14/10/2026
 
+Lớp trợ lý OpenAI được bổ sung độc lập sau handoff này: [HANDOFF_OPENAI_ASSISTANT.md](HANDOFF_OPENAI_ASSISTANT.md). Core navigation của tài liệu này tiếp tục là nguồn chỉ dẫn chính.
+
 ## Yêu cầu và kết quả
 
 - Đổi routing ô tô sang Valhalla `pedestrian`, giữ geometry đầy đủ.

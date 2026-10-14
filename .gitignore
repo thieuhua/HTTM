@@ -53,3 +53,5 @@ app.*.map.json
 
 #git
 **/.env
+ai_server/.assistant-state/
+**/.env.*.local

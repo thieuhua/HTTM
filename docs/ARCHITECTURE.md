@@ -52,6 +52,14 @@ Tuyến được kiểm tra mỗi 5 giây, cập nhật sau 30 giây nếu đã 
 
 `VALHALLA_URL` cấu hình server; `AI_SERVER_URL` cấu hình Flutter, ưu tiên dart-define rồi `.env`. Chạy Nominatim proxy một worker để giữ rate limit trong process.
 
+## Lớp trợ lý OpenAI bổ sung
+
+`SessionController → AssistantController → AiAssistantService → /assistant/chat → Responses API` là luồng riêng, không tham gia vòng quyết định GPS/YOLO. Trợ lý đọc snapshot, nhận ảnh hiện tại khi user yêu cầu, dùng tools truy vấn/tìm địa điểm/tạo proposal. Proposal chỉ gọi callback dẫn đường sau xác nhận của người dùng và kiểm tra context lại. AI TTS có ưu tiên thấp nhất.
+
+Backend giữ key trong `ai_server/.env`; Flutter giữ `.env` URL hiện tại và token thiết bị runtime trong secure storage. Endpoint assistant dùng HTTPS, ghép nối/HMAC, rate limit, budget SQLite và bounded tool loop. Chủ động theo sự kiện, opt-in và cooldown; không gửi ảnh/model request mỗi frame. Xem [handoff OpenAI](HANDOFF_OPENAI_ASSISTANT.md) cho giao thức, cấu hình, kiểm thử và giới hạn.
+
+Nút nói chính và text hội thoại cùng gọi `SessionController.handleUtterance → VoiceCommand.parse`: mẫu dẫn đường gốc chạy local trước, phần còn lại đi qua assistant. `AssistantPanel` hiển thị câu trả lời và xác nhận proposal trực tiếp trên màn bản đồ. Ghép nối có nhập/dán/QR, giữ input khi lỗi. QR chỉ chứa enrollment code và không thay URL backend; camera được nhường tạm cho scanner rồi khôi phục YOLO, còn GPS/TTS dẫn đường vẫn chạy. Chi tiết giao thức và vòng đời camera nằm trong handoff OpenAI.
+
 ## Giới hạn được giữ rõ
 
 La bàn là hướng đầu điện thoại, không phải hướng cơ thể. Map matching cục bộ không xác định được bên vỉa hè hoặc tầng trong nhà. Đi bộ theo dữ liệu OSM chưa chứng minh tuyến an toàn/tiếp cận cho người khiếm thị. Camera dùng bbox heuristic, chưa có depth, walkable-area hoặc tránh/sang đường tự động. App chưa dẫn đường khi khóa màn hình. Các bước xác minh và tiếp tục được liệt kê trong handoff.

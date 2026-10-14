@@ -18,3 +18,17 @@ Detection: `/detect` multipart JPEG; model selected with `YOLO_MODEL`, confidenc
 Tests: `.venv\Scripts\python.exe -X utf8 -B -m unittest discover -p "test_*.py" -v`.
 
 See [handoff](../docs/HANDOFF_PEDESTRIAN.md) for contract changes and phone validation.
+
+Optional OpenAI Assistant: `OPENAI_API_KEY` is read only from this directory's `.env`.
+Run `python setup_assistant.py` to provision signing/pairing secrets; use
+`--show-pairing-code` to give the device its pairing code, never the OpenAI key.
+Assistant endpoints require HTTPS, device bearer auth, and persistent SQLite
+rate/spend limits. No tool directly changes navigation. Defaults: 1 USD/day total,
+0.5 USD/day/device, 6 turns/min/device, 0.05 USD maximum reservation/turn.
+See [OpenAI handoff](../docs/HANDOFF_OPENAI_ASSISTANT.md) for configuration and local
+HTTP debug exceptions. Navigation endpoints remain independent of assistant configuration.
+
+Run `python setup_assistant.py --qr` to create `.assistant-state/pairing-qr.png`
+locally. Keep it private: it contains the device pairing credential, not the OpenAI
+key or signing secret. It is ignored by Git and is not served by the backend.
+Scan it in the app's pairing screen, then press Pair. Existing secrets are preserved.

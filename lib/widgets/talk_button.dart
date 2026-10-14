@@ -14,7 +14,7 @@ class TalkButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return Semantics(
       button: true,
-      label: 'Nhập lệnh bằng giọng nói',
+      label: 'Nói lệnh dẫn đường hoặc hỏi trợ lý AI',
       hint:
           'Nhấn giữ để nói; với trình đọc màn hình, kích hoạt để bắt đầu hoặc kết thúc.',
       onTap: () => controller.isListening

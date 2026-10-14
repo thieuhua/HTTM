@@ -8,11 +8,15 @@ import logging
 from fastapi import FastAPI, File, HTTPException, UploadFile, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from starlette.responses import JSONResponse
 from PIL import Image, UnidentifiedImageError
 
 from detector import YoloObstacleDetector
 from geocoder import GeocodeError, geocode, reverse_geocode
 from routing import RouteError, plan_route
+from assistant_router import router as assistant_router, AssistantBoundary, error_response
+from assistant_guard import AssistantError
 
 
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +31,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 detector = YoloObstacleDetector()
+app.include_router(assistant_router)
+app.add_middleware(AssistantBoundary)
+
+
+@app.exception_handler(AssistantError)
+async def assistant_failure(request, error):
+    return error_response(error)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_failure(request, error):
+    if request.url.path.startswith('/assistant/'):
+        return JSONResponse({"error": {"code": "invalid_request", "message": "Dữ liệu trợ lý không hợp lệ."}}, status_code=422)
+    return JSONResponse({"detail": [{"loc": item['loc'], "msg": item['msg'], "type": item['type']} for item in error.errors()]}, status_code=422)
 
 
 @app.get("/health")

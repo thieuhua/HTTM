@@ -10,6 +10,8 @@ import '../widgets/navigation_map.dart';
 import '../widgets/perception_preview.dart';
 import '../widgets/talk_button.dart';
 import 'route_debug_screen.dart';
+import 'assistant_screen.dart';
+import '../widgets/assistant_panel.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key, required this.controller});
@@ -100,11 +102,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  void _openAssistant() => unawaited(
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => AssistantScreen(controller: widget.controller),
+      ),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(
       title: const Text('Dẫn đường đi bộ'),
       actions: [
+        IconButton(
+          tooltip: 'Trợ lý AI',
+          icon: const Icon(Icons.chat_bubble_outline),
+          onPressed: _openAssistant,
+        ),
         IconButton(
           tooltip: _cameraView ? 'Mở bản đồ' : 'Xem camera',
           icon: Icon(_cameraView ? Icons.map : Icons.camera_alt),
@@ -270,6 +285,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             }
                             return const SizedBox.shrink();
                           },
+                        ),
+                        const Divider(),
+                        AssistantPanel(
+                          controller: widget.controller,
+                          onOpen: _openAssistant,
                         ),
                         Row(
                           mainAxisAlignment: MainAxisAlignment.spaceEvenly,

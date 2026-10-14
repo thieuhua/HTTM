@@ -18,6 +18,10 @@ import '../services/obstacle_reasoning_service.dart';
 import '../services/route_service.dart';
 import '../services/tts_service.dart';
 import '../services/voice_service.dart';
+import '../services/voice_command_router.dart';
+import '../services/assistant_service.dart';
+import '../models/assistant_state.dart';
+import 'assistant_controller.dart';
 
 /// Conductor tying the camera/YOLO perception loop, pedestrian navigation,
 /// the talk button, and TTS output into one place the UI just observes.
@@ -30,13 +34,15 @@ class SessionController {
     VoiceService? voiceService,
     TtsService? ttsService,
     GeocodingService? geocodingService,
+    AiAssistantService? assistantService,
   }) : _frameSource = frameSource ?? FrameSource(),
        _detectionService = detectionService ?? AiDetectionService(),
        _reasoningService = reasoningService ?? ObstacleReasoningService(),
        _routeService = routeService ?? PedestrianRouteService(),
        _voiceService = voiceService ?? VoiceService(),
        _ttsService = ttsService ?? TtsService(),
-       _geocodingService = geocodingService ?? GeocodingService();
+       _geocodingService = geocodingService ?? GeocodingService(),
+       _assistantService = assistantService ?? AiAssistantService();
 
   final FrameSource _frameSource;
   final AiDetectionService _detectionService;
@@ -45,6 +51,37 @@ class SessionController {
   final VoiceService _voiceService;
   final TtsService _ttsService;
   final GeocodingService _geocodingService;
+  final AiAssistantService _assistantService;
+  List<DetectedObject> _latestObjects = const [];
+  DateTime? _yoloAt;
+  Uint8List? _latestJpeg;
+  DateTime? _jpegAt;
+  late final AssistantController assistant = AssistantController(
+    service: _assistantService,
+    snapshot: () => routeSnapshot,
+    detections: () => _latestObjects,
+    yoloUpdatedAt: () => _yoloAt,
+    captureImage: _assistantImage,
+    onConfirmed: _performAssistantAction,
+    speak: (text) => _ttsService.speak(text, priority: 0),
+    canSpeak: () =>
+        !_disposed &&
+        !_cameraBorrowed &&
+        !_navigationPaused &&
+        !_isListening &&
+        !_wasDangerous &&
+        (_obstacleUntil == null || DateTime.now().isAfter(_obstacleUntil!)) &&
+        (_lastRouteSpokenAt == null ||
+            DateTime.now().difference(_lastRouteSpokenAt!) >
+                const Duration(seconds: 8)),
+    canProactivelyRequest: () =>
+        !_disposed &&
+        !_cameraBorrowed &&
+        !_navigationPaused &&
+        !_isListening &&
+        !_wasDangerous &&
+        _pendingDestination == null,
+  );
 
   final StreamController<SessionState> _stateController =
       StreamController<SessionState>.broadcast();
@@ -77,6 +114,11 @@ class SessionController {
   bool _locatingAddress = false;
   bool _navigationPaused = false;
   Future<void>? _listeningStart;
+  bool _cameraBorrowed = false;
+  Completer<void>? _cameraIdle;
+  int _perceptionEpoch = 0;
+  String? lastUtterance;
+  VoiceCommandKind? lastCommandKind;
 
   Stream<SessionState> get states => _stateController.stream;
   Stream<PerceptionFrame> get frames => _frameController.stream;
@@ -89,8 +131,10 @@ class SessionController {
 
   Future<void> initialize() async {
     await _ttsService.initialize();
+    unawaited(assistant.initialize());
     _routeSubscription = _routeService.instructions.listen((instruction) {
       _lastRoute = instruction;
+      assistant.observe(routeSnapshot);
       if (!_wasDangerous &&
           !_isListening &&
           !_disposed &&
@@ -146,6 +190,7 @@ class SessionController {
   Future<void> refreshRoute() => _routeService.refresh();
   Future<void> clearJourney() => _routeService.clearJourney();
   void cancelDestination() {
+    assistant.invalidate();
     ++_destinationRequest;
     _pendingDestination = null;
     _routeService.cancelDestination();
@@ -157,6 +202,7 @@ class SessionController {
   }
 
   void pauseNavigation() {
+    assistant.invalidate();
     _navigationPaused = true;
     unawaited(_ttsService.silence());
     stop();
@@ -173,6 +219,7 @@ class SessionController {
   }
 
   Future<bool> navigateTo(Placemark place) async {
+    assistant.invalidate();
     ++_destinationRequest;
     _pendingDestination = null;
     _lastRouteKey = null;
@@ -233,11 +280,17 @@ class SessionController {
   }
 
   Future<bool> start() async {
-    if (_disposed || _navigationPaused || _running || !_frameSource.isReady) {
+    if (_disposed ||
+        _cameraBorrowed ||
+        _navigationPaused ||
+        _running ||
+        !_frameSource.isReady) {
       return false;
     }
     final healthy = await _detectionService.isHealthy();
-    if (_disposed || _navigationPaused) return false;
+    if (_disposed || _cameraBorrowed || _navigationPaused || _running) {
+      return false;
+    }
     if (!healthy) {
       cameraError = 'Không kết nối được AI vật cản. Kiểm tra AI Server.';
       _stateController.add(
@@ -257,6 +310,7 @@ class SessionController {
   }
 
   void stop() {
+    ++_perceptionEpoch;
     _captureTimer?.cancel();
     _captureTimer = null;
     _running = false;
@@ -264,15 +318,33 @@ class SessionController {
   }
 
   Future<void> _captureAndDetect() async {
-    if (!_running || _requestInProgress || !_frameSource.isReady) return;
+    if (!_running ||
+        _cameraBorrowed ||
+        _requestInProgress ||
+        !_frameSource.isReady) {
+      return;
+    }
     _requestInProgress = true;
+    final epoch = _perceptionEpoch;
+    final cameraIdle = _cameraIdle = Completer<void>();
     final startedAt = DateTime.now();
     XFile? image;
     try {
       image = await _frameSource.captureFrame();
+      try {
+        _latestJpeg = await image.readAsBytes();
+        _jpegAt = DateTime.now();
+      } catch (_) {
+        // Assistant caching must never fail the existing YOLO pipeline.
+        _latestJpeg = null;
+        _jpegAt = null;
+      }
+      cameraIdle.complete();
       final result = await _detectionService.detect(image);
-      if (_disposed || !_running) return;
+      if (_disposed || !_running || epoch != _perceptionEpoch) return;
       cameraError = null;
+      _latestObjects = result.objects;
+      _yoloAt = DateTime.now();
       final latencyMs = DateTime.now().difference(startedAt).inMilliseconds;
       final fps = latencyMs > 0 ? 1000 / latencyMs : 0.0;
       _frameController.add(
@@ -286,17 +358,18 @@ class SessionController {
       );
       await _processResult(result);
     } on CameraException {
-      if (_running) {
+      if (_running && epoch == _perceptionEpoch) {
         _stateController.add(
           const SessionRunning(statusText: 'Lỗi chụp ảnh từ camera.'),
         );
       }
     } on AiDetectionException catch (error) {
-      if (_running) {
+      if (_running && epoch == _perceptionEpoch) {
         cameraError = error.message;
         _stateController.add(SessionRunning(statusText: error.message));
       }
     } finally {
+      if (!cameraIdle.isCompleted) cameraIdle.complete();
       _requestInProgress = false;
       if (image != null) {
         try {
@@ -412,7 +485,6 @@ class SessionController {
       return;
     }
     if (_disposed) return;
-    final request = ++_destinationRequest;
     final text = await _voiceService.stopListening();
     if (_disposed) return;
     _isListening = false;
@@ -424,40 +496,62 @@ class SessionController {
       return;
     }
 
-    final destinationQuery = _destinationFrom(text);
-    final normalized = text.trim().toLowerCase();
-    if (_pendingDestination != null &&
-        ['xác nhận', 'đúng', 'đúng rồi', 'đồng ý'].contains(normalized)) {
-      final place = _pendingDestination!;
-      await navigateTo(place);
-      return;
+    await handleUtterance(text);
+  }
+
+  /// Shared by the primary microphone and typed conversation. Core templates
+  /// never need OpenAI, and only this controller may execute navigation actions.
+  Future<void> handleUtterance(String text, {bool includeImage = false}) async {
+    if (_disposed || text.trim().isEmpty) return;
+    final request = ++_destinationRequest;
+    final command = VoiceCommand.parse(text);
+    lastUtterance = text.trim();
+    lastCommandKind = command.kind;
+    _stateController.add(SessionRunning(statusText: routeSnapshot.message));
+    if (command.kind != VoiceCommandKind.assistant &&
+        command.kind != VoiceCommandKind.confirm &&
+        command.kind != VoiceCommandKind.dismiss) {
+      assistant.invalidate();
     }
-    if (['hủy', 'không', 'không đúng'].contains(normalized)) {
-      _pendingDestination = null;
-      await _ttsService.speak('Đã hủy địa điểm vừa tìm.');
-      return;
+    switch (command.kind) {
+      case VoiceCommandKind.confirm:
+        if (_pendingDestination != null) {
+          await confirmPendingDestination();
+        } else if (assistant.state.proposal != null) {
+          await assistant.confirmProposal();
+        } else {
+          await _ttsService.speak('Chưa có thao tác đang chờ xác nhận.');
+        }
+        return;
+      case VoiceCommandKind.dismiss:
+        assistant.invalidate();
+        cancelPendingDestination();
+        await _ttsService.speak('Đã bỏ yêu cầu đang chờ xác nhận.');
+        return;
+      case VoiceCommandKind.location:
+        await describeLocation();
+        return;
+      case VoiceCommandKind.cancelNavigation:
+        cancelDestination();
+        return;
+      case VoiceCommandKind.repeat:
+        await repeatInstruction();
+        return;
+      case VoiceCommandKind.refresh:
+        await refreshRoute();
+        return;
+      case VoiceCommandKind.assistant:
+        // Avoid two simultaneous confirmations for different destinations.
+        _pendingDestination = null;
+        await assistant.ask(
+          text,
+          includeImage: includeImage || command.includeImage,
+        );
+        return;
+      case VoiceCommandKind.destination:
+        _pendingDestination = null;
     }
-    if (normalized.contains('tôi ở đâu') || normalized.contains('đang ở đâu')) {
-      await describeLocation();
-      return;
-    }
-    if (normalized == 'dừng dẫn đường' || normalized == 'hủy dẫn đường') {
-      cancelDestination();
-      return;
-    }
-    if (normalized == 'nhắc lại') {
-      await repeatInstruction();
-      return;
-    }
-    if (destinationQuery == null) {
-      _stateController.add(
-        SessionRunning(
-          statusText: _running ? 'AI đang chạy' : 'AI đã dừng',
-          subStatusText: 'Lệnh: $text',
-        ),
-      );
-      return;
-    }
+    final destinationQuery = command.destination!;
 
     _stateController.add(
       SessionRunning(
@@ -468,6 +562,7 @@ class SessionController {
     try {
       final place = await findDestination(destinationQuery);
       if (_disposed || request != _destinationRequest) return;
+      assistant.invalidate();
       _pendingDestination = place;
       final confirmation =
           'Địa điểm tìm được: ${place.displayName}. Nói “xác nhận” để dẫn đường, hoặc “hủy”.';
@@ -485,31 +580,100 @@ class SessionController {
     }
   }
 
-  /// Strips a leading "đi đến"/"dẫn tôi đến"-style prefix so only the place
-  /// name is sent to geocoding. Returns null when the phrase carries no
-  /// recognizable destination intent.
-  String? _destinationFrom(String text) {
-    final normalized = text.trim().toLowerCase();
-    const prefixes = [
-      'dẫn tôi đến',
-      'dẫn tôi tới',
-      'đưa tôi đến',
-      'đưa tôi tới',
-      'đi đến',
-      'đi tới',
-      'tới',
-      'đến',
-    ];
-    for (final prefix in prefixes) {
-      if (normalized.startsWith(prefix)) {
-        final rest = text.trim().substring(prefix.length).trim();
-        return rest.isEmpty ? null : rest;
-      }
+  bool get isListening => _isListening;
+
+  /// Temporarily lend the one camera to QR scanning, without stopping GPS or
+  /// route guidance. Wait for capture, not for the network detection response.
+  Future<bool> suspendCameraForQr() async {
+    if (_disposed || _cameraBorrowed || _isListening) {
+      throw const AssistantException('Hãy kết thúc ghi âm trước khi quét QR.');
     }
-    return null;
+    final wasRunning = _running;
+    _cameraBorrowed = true;
+    assistant.invalidate();
+    stop();
+    try {
+      await _cameraIdle?.future.timeout(const Duration(seconds: 10));
+      await _frameSource.dispose();
+      _latestJpeg = null;
+      _jpegAt = null;
+      if (_disposed) return wasRunning;
+      _stateController.add(
+        const SessionRunning(statusText: 'Đang quét QR ghép nối.'),
+      );
+      return wasRunning;
+    } catch (_) {
+      _cameraBorrowed = false;
+      if (wasRunning) unawaited(start());
+      throw const AssistantException('Camera đang bận. Hãy thử quét QR lại.');
+    }
   }
 
-  bool get isListening => _isListening;
+  Future<void> resumeCameraAfterQr({required bool restartPerception}) async {
+    if (!_cameraBorrowed || _disposed) return;
+    try {
+      await _frameSource.initialize();
+      cameraError = null;
+    } catch (_) {
+      cameraError = 'Chưa mở lại được camera. Bản đồ và GPS vẫn hoạt động.';
+    } finally {
+      _cameraBorrowed = false;
+    }
+    if (_disposed) {
+      await _frameSource.dispose();
+      return;
+    }
+    _stateController.add(SessionRunning(statusText: routeSnapshot.message));
+    if (restartPerception) await start();
+  }
+
+  Future<AssistantImage> _assistantImage() async {
+    if (_cameraBorrowed) {
+      throw const AssistantException('Camera đang được dùng để quét QR.');
+    }
+    if (_latestJpeg != null &&
+        _jpegAt != null &&
+        DateTime.now().difference(_jpegAt!) < const Duration(seconds: 5)) {
+      return AssistantImage(_latestJpeg!, _jpegAt!);
+    }
+    if (_requestInProgress || !_frameSource.isReady) {
+      throw const AssistantException('Camera chưa sẵn sàng để phân tích ảnh.');
+    }
+    _requestInProgress = true;
+    final cameraIdle = _cameraIdle = Completer<void>();
+    XFile? image;
+    try {
+      image = await _frameSource.captureFrame();
+      final bytes = await image.readAsBytes();
+      final capturedAt = DateTime.now();
+      _latestJpeg = bytes;
+      _jpegAt = capturedAt;
+      return AssistantImage(bytes, capturedAt);
+    } finally {
+      cameraIdle.complete();
+      _requestInProgress = false;
+      if (image != null) {
+        try {
+          await File(image.path).delete();
+        } catch (_) {}
+      }
+    }
+  }
+
+  Future<void> _performAssistantAction(AssistantProposal proposal) async {
+    switch (proposal.action) {
+      case 'set_destination':
+        await navigateTo(proposal.place!);
+      case 'refresh_route':
+        await refreshRoute();
+      case 'cancel_navigation':
+        cancelDestination();
+      case 'repeat_instruction':
+        await repeatInstruction();
+      case 'describe_location':
+        await describeLocation();
+    }
+  }
 
   Future<void> dispose() async {
     if (_disposed) return;
@@ -517,6 +681,7 @@ class SessionController {
     ++_destinationRequest;
     _routeSpeechTimer?.cancel();
     _captureTimer?.cancel();
+    await assistant.dispose();
     await _routeSubscription?.cancel();
     await _routeService.dispose();
     await _frameSource.dispose();
