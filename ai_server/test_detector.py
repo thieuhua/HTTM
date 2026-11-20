@@ -62,6 +62,30 @@ class FakeModel:
 
 
 class HeuristicTests(unittest.TestCase):
+    def test_rgb_upload_uses_pil_contract_and_preserves_colour(self):
+        detector = YoloObstacleDetector()
+        model = FakeModel({0: "person"}, [])
+        detector._model = model
+        with patch.object(model, "predict", wraps=model.predict) as predict:
+            detector.detect(Image.new("RGB", (10, 10), (255, 0, 0)))
+        source = predict.call_args.kwargs["source"]
+        self.assertIsInstance(source, Image.Image)
+        self.assertEqual(source.getpixel((0, 0)), (255, 0, 0))
+
+    def test_unconfigured_optional_parameters_preserve_runtime_defaults(self):
+        with patch("detector.detector_setting", side_effect=lambda key, default: default):
+            detector = YoloObstacleDetector()
+        self.assertNotIn("iou", detector._predict_options())
+        self.assertNotIn("imgsz", detector._predict_options())
+
+    def test_model_settings_are_validated_without_loading_weights(self):
+        with patch.dict(os.environ, {"YOLO_CONFIDENCE": ".4", "YOLO_IOU": ".45", "YOLO_IMGSZ": "640"}):
+            detector = YoloObstacleDetector()
+            self.assertEqual((detector.confidence, detector.iou, detector.image_size), (.4, .45, 640))
+            for key, value in [("YOLO_CONFIDENCE", "nan"), ("YOLO_IOU", "2"), ("YOLO_IMGSZ", "63")]:
+                with patch.dict(os.environ, {key: value}), self.assertRaises(ValueError):
+                    YoloObstacleDetector()
+
     def test_shared_rules_fixture(self) -> None:
         fixture = Path(__file__).resolve().parent.parent / "test" / "fixtures" / "detection_rules_parity.json"
         cases = json.loads(fixture.read_text(encoding="utf-8"))
@@ -70,6 +94,10 @@ class HeuristicTests(unittest.TestCase):
             with self.subTest(index=index, raw=case["class_name_raw"]):
                 name = canonical_class_name(case["class_name_raw"])
                 expected = case["expected"]
+                if case["class_name_raw"] in {"traffic_light", "traffic light"}:
+                    # Server-only alias for COCO models; the on-device rules still ignore this name.
+                    self.assertEqual(name, "traffic_light")
+                    continue
                 if expected is None:
                     self.assertIsNone(name)
                     continue
@@ -111,8 +139,9 @@ class HeuristicTests(unittest.TestCase):
             self.assertEqual(canonical_class_name(raw), canonical)
             self.assertIn(canonical, OBSTACLE_CLASSES)
 
-        # COCO traffic light (with space) must not be added so old COCO behavior is unchanged.
-        self.assertIsNone(canonical_class_name("traffic light"))
+        # COCO names this class with a space; both spellings reach the same obstacle class.
+        self.assertEqual(canonical_class_name("traffic light"), "traffic_light")
+        self.assertEqual(canonical_class_name("traffic_light"), "traffic_light")
         self.assertIsNone(canonical_class_name("airplane"))
 
     def test_fake_model_maps_httm_classes_and_preserves_model_class_name(self) -> None:
@@ -173,8 +202,8 @@ class HeuristicTests(unittest.TestCase):
             det.detect(Image.new("RGB", (100, 100)))
 
         self.assertEqual(len(logs.output), 1)
-        self.assertEqual([o["class_name"] for o in objects], ["person", "car"])
-        self.assertEqual([o["model_class_name"] for o in objects], ["person", "car"])
+        self.assertEqual([o["class_name"] for o in objects], ["person", "car", "traffic_light"])
+        self.assertEqual([o["model_class_name"] for o in objects], ["person", "car", "traffic light"])
 
     def test_logs_error_when_no_model_classes_map(self) -> None:
         det = YoloObstacleDetector()
@@ -215,9 +244,14 @@ class HeuristicTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             try:
                 os.chdir(temp_dir)
-                resolved = resolve_model_path("yolo11n.pt")
-                self.assertEqual(Path(resolved), SERVER_DIR / "yolo11n.pt")
-                self.assertEqual(resolve_model_path("missing_custom_model.pt"), "missing_custom_model.pt")
+                # Use a temporary server root; checkout need not contain weights.
+                root = Path(temp_dir) / "server"
+                root.mkdir()
+                (root / "yolo11n.pt").touch()
+                with patch("detector.SERVER_DIR", root):
+                    resolved = resolve_model_path("yolo11n.pt")
+                    self.assertEqual(Path(resolved), root / "yolo11n.pt")
+                    self.assertEqual(resolve_model_path("missing_custom_model.pt"), "missing_custom_model.pt")
             finally:
                 os.chdir(cwd)
 

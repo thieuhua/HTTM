@@ -19,6 +19,8 @@ flowchart TD
   Nav --> Map[NavigationMap: OSM + GPS + hướng + tuyến còn lại]
   Nav --> Session
   Camera[Camera duy nhất → YOLO] --> Obstacle[ObstacleReasoningService]
+  Camera --> Segment[FastAPI POST /segment → tunnel loopback → Colab SegFormer v2]
+  Segment --> Summary[ratios + grid 3x3 + path_clear + suggest + hazards]
   Obstacle --> Session
   Session --> TTS[TTS có ưu tiên + Haptic]
 ```
@@ -46,11 +48,18 @@ Tuyến được kiểm tra mỗi 5 giây, cập nhật sau 30 giây nếu đã 
 
 - `GET /health`: health, routing profile, API version.
 - `POST /detect`: YOLO như trước.
+- `POST /segment`: phân vùng tùy chọn, chạy song song YOLO; multipart `image`, query `diagnostics=false`, `mask=none|png|rle` (sai mask → 422). Bật bằng `COLAB_SEG_URL` HTTP loopback; rỗng là tắt, không ảnh hưởng `/detect` hoặc `/health`.
 - `GET /geocode?q=&near_lat=&near_lng=`: địa điểm ưu tiên vùng hiện tại, chờ người dùng xác nhận.
 - `GET /reverse?lat=&lng=`: địa chỉ gần vị trí theo yêu cầu.
 - `GET /route?from_lat=&from_lng=&to_lat=&to_lng=`: Valhalla pedestrian, geometry và maneuvers đầy đủ.
 
 `VALHALLA_URL` cấu hình server; `AI_SERVER_URL` cấu hình Flutter, ưu tiên dart-define rồi `.env`. Chạy Nominatim proxy một worker để giữ rate limit trong process.
+
+`/segment` trả `success=true`, `image_width`/`image_height` của **ảnh vừa tải lên sau EXIF transpose**, `classes` theo thứ tự `other floor sidewalk road crosswalk stairs curb terrain obstacle`, `ratios` (tên → tỷ lệ), `grid` 3x3 (hàng 0 xa/trên, hàng 2 gần/dưới; cột trái/giữa/phải; mỗi ô có `walkable`, `caution`, `blocked` trong [0,1] và `dominant`), `path_clear` bool, `suggest` (`straight|left|right|stop`), `hazards` (tập con của `stairs_ahead`, `curb_ahead`, `road_ahead`, `crosswalk_ahead`, `obstacle_ahead`) và `cached` bool. Khi yêu cầu mask, chuyển nguyên `mask_w`, `mask_h` và `mask_png_b64` hoặc `mask_rle`; mask thuộc ảnh gửi worker đã thu nhỏ cạnh dài tối đa 640. Diagnostics chỉ khi yêu cầu: `source=colab`, `model`, `runtime` dạng `cuda/fp16`, `inference_ms` đo toàn lời gọi server, thêm `cache_age_ms` khi cached. Chi tiết PNG class-ID/RLE đa lớp xem [README server](../ai_server/README.md).
+
+Giới hạn upload, EXIF và lỗi 400/413 dùng chung với `/detect`. Lỗi 503 có `detail` cố định `Segmentation worker unavailable.` (tắt/chưa sẵn sàng/cooldown/worker 503) hoặc `Segmentation worker busy.` (đang xử lý/chưa đủ khoảng cách và thiếu cache tươi/pool timeout); lỗi bất ngờ là 500 `Segmentation failed.`. `SegmentationWorker` có một HTTP client keep-alive chung cho health mỗi 4 giây và inference, timeout 3 giây (connect 0,3; pool 0,1), expiry 30 giây. Khóa in-flight không chờ; `SEG_MIN_INTERVAL_MS=500` giới hạn khoảng cách giữa các lần gửi, cache riêng từng mask mode chỉ dùng khi tuổi <1,5 giây, xóa khi worker mất sẵn sàng. Worker 503 cooldown 5 giây; lỗi HTTP/timeout/JSON/hợp đồng cooldown 10 giây. Không lưu ảnh ra đĩa, không cache theo nội dung ảnh, không có segmentation fallback CPU.
+
+Chỉ vận hành **v2 `runs/segformer_b5_v2/best`, tuyệt đối không v1**; `/health` worker chỉ có tên thư mục `best`, cần xác nhận đường dẫn v2 đầy đủ trong log Colab. `stairs` yếu (IoU khoảng 0,18), **không dùng để cảnh báo cầu thang** hoặc kết luận không có cầu thang khi thiếu hazard. Curb/crosswalk chỉ là gợi ý. Flutter gọi `/segment` sau cờ `WALKABLE_SEG` (mặc định tắt) qua `SegmentationService`, dùng lại frame của YOLO, không chờ, mỗi ~1,8 giây; `WalkableGuidance` (lớp thuần) áp hysteresis/cooldown và bỏ qua `stairs_ahead`. Lỗi phân vùng chỉ làm tắt phân vùng, không gọi luồng mất nhận diện YOLO. Chưa kiểm thử thực địa và chưa đo độ trễ đầu-cuối. Xem [handoff phân vùng](HANDOFF_WALKABLE_SEG.md).
 
 ## Lớp trợ lý OpenAI bổ sung
 
@@ -62,4 +71,4 @@ Nút nói chính và text hội thoại cùng gọi `SessionController.handleUtt
 
 ## Giới hạn được giữ rõ
 
-Bản demo giả định người dùng cầm điện thoại nghiêng (như khi đọc màn hình), đầu máy hướng về phía trước: hướng la bàn là hướng của cạnh trên điện thoại, nên máy dựng đứng hoàn toàn sẽ cho hướng sai (flutter_compass trên Android không cung cấp hướng theo trục camera). Chỉ dẫn ưu tiên la bàn còn mới; GPS course là dự phòng khi đang đi với sai số ≤10 m. Bốn mức chỉ hướng có hysteresis 8° để tránh đổi câu liên tục ở ranh giới. GPS demo chấp nhận sai số ≤50 m và fix không quá 30 giây; khi GPS yếu mà đã có tuyến, tiếp tục chỉ hướng từ vị trí khớp tuyến gần nhất và cảnh báo một lần mỗi đợt. Map matching cục bộ không xác định được bên vỉa hè hoặc tầng trong nhà. Đi bộ theo dữ liệu OSM chưa chứng minh tuyến an toàn/tiếp cận cho người khiếm thị. Camera dùng bbox heuristic, chưa có depth, walkable-area hoặc tránh/sang đường tự động. App chưa dẫn đường khi khóa màn hình. Các bước xác minh và tiếp tục được liệt kê trong handoff.
+Bản demo giả định người dùng cầm điện thoại nghiêng (như khi đọc màn hình), đầu máy hướng về phía trước: hướng la bàn là hướng của cạnh trên điện thoại, nên máy dựng đứng hoàn toàn sẽ cho hướng sai (flutter_compass trên Android không cung cấp hướng theo trục camera). Chỉ dẫn ưu tiên la bàn còn mới; GPS course là dự phòng khi đang đi với sai số ≤10 m. Bốn mức chỉ hướng có hysteresis 8° để tránh đổi câu liên tục ở ranh giới. GPS demo chấp nhận sai số ≤50 m và fix không quá 30 giây; khi GPS yếu mà đã có tuyến, tiếp tục chỉ hướng từ vị trí khớp tuyến gần nhất và cảnh báo một lần mỗi đợt. Map matching cục bộ không xác định được bên vỉa hè hoặc tầng trong nhà. Đi bộ theo dữ liệu OSM chưa chứng minh tuyến an toàn/tiếp cận cho người khiếm thị. Camera YOLO dùng bbox heuristic; backend có phân vùng walkable-area tùy chọn qua Colab v2, chưa có depth hoặc tránh/sang đường tự động. Phân vùng là gợi ý trong không gian ảnh; stairs yếu (IoU khoảng 0,18) không dùng để cảnh báo cầu thang, curb/crosswalk chỉ là gợi ý. App chưa dẫn đường khi khóa màn hình. Các bước xác minh và tiếp tục được liệt kê trong handoff.

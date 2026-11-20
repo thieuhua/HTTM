@@ -1,0 +1,452 @@
+{
+  "provenance": "Generated offline from walkable-seg worker_seg.create_app with FakeModel; no checkpoint loaded.",
+  "health": {
+    "status": "ok",
+    "ready": true,
+    "model": "best",
+    "runtime": {
+      "device": "cpu",
+      "fp16": false
+    },
+    "task": "segmentation",
+    "classes": [
+      "other",
+      "floor",
+      "sidewalk",
+      "road",
+      "crosswalk",
+      "stairs",
+      "curb",
+      "terrain",
+      "obstacle"
+    ]
+  },
+  "none": {
+    "w": 64,
+    "h": 48,
+    "classes": [
+      "other",
+      "floor",
+      "sidewalk",
+      "road",
+      "crosswalk",
+      "stairs",
+      "curb",
+      "terrain",
+      "obstacle"
+    ],
+    "ratios": {
+      "other": 0.3333333333333333,
+      "floor": 0.4427083333333333,
+      "sidewalk": 0.0,
+      "road": 0.0,
+      "crosswalk": 0.0,
+      "stairs": 0.0,
+      "curb": 0.109375,
+      "terrain": 0.0,
+      "obstacle": 0.11458333333333333
+    },
+    "grid": [
+      [
+        {
+          "walkable": 0.0,
+          "caution": 0.0,
+          "blocked": 1.0,
+          "dominant": "other"
+        },
+        {
+          "walkable": 0.0,
+          "caution": 0.0,
+          "blocked": 1.0,
+          "dominant": "other"
+        },
+        {
+          "walkable": 0.0,
+          "caution": 0.0,
+          "blocked": 1.0,
+          "dominant": "other"
+        }
+      ],
+      [
+        {
+          "walkable": 1.0,
+          "caution": 0.0,
+          "blocked": 0.0,
+          "dominant": "floor"
+        },
+        {
+          "walkable": 0.0,
+          "caution": 1.0,
+          "blocked": 0.0,
+          "dominant": "curb"
+        },
+        {
+          "walkable": 1.0,
+          "caution": 0.0,
+          "blocked": 0.0,
+          "dominant": "floor"
+        }
+      ],
+      [
+        {
+          "walkable": 1.0,
+          "caution": 0.0,
+          "blocked": 0.0,
+          "dominant": "floor"
+        },
+        {
+          "walkable": 1.0,
+          "caution": 0.0,
+          "blocked": 0.0,
+          "dominant": "floor"
+        },
+        {
+          "walkable": 0.0,
+          "caution": 0.0,
+          "blocked": 1.0,
+          "dominant": "obstacle"
+        }
+      ]
+    ],
+    "path_clear": true,
+    "suggest": "left",
+    "hazards": [
+      "curb_ahead"
+    ],
+    "latency_ms": 4.695999999967171
+  },
+  "png": {
+    "w": 64,
+    "h": 48,
+    "classes": [
+      "other",
+      "floor",
+      "sidewalk",
+      "road",
+      "crosswalk",
+      "stairs",
+      "curb",
+      "terrain",
+      "obstacle"
+    ],
+    "ratios": {
+      "other": 0.3333333333333333,
+      "floor": 0.4427083333333333,
+      "sidewalk": 0.0,
+      "road": 0.0,
+      "crosswalk": 0.0,
+      "stairs": 0.0,
+      "curb": 0.109375,
+      "terrain": 0.0,
+      "obstacle": 0.11458333333333333
+    },
+    "grid": [
+      [
+        {
+          "walkable": 0.0,
+          "caution": 0.0,
+          "blocked": 1.0,
+          "dominant": "other"
+        },
+        {
+          "walkable": 0.0,
+          "caution": 0.0,
+          "blocked": 1.0,
+          "dominant": "other"
+        },
+        {
+          "walkable": 0.0,
+          "caution": 0.0,
+          "blocked": 1.0,
+          "dominant": "other"
+        }
+      ],
+      [
+        {
+          "walkable": 1.0,
+          "caution": 0.0,
+          "blocked": 0.0,
+          "dominant": "floor"
+        },
+        {
+          "walkable": 0.0,
+          "caution": 1.0,
+          "blocked": 0.0,
+          "dominant": "curb"
+        },
+        {
+          "walkable": 1.0,
+          "caution": 0.0,
+          "blocked": 0.0,
+          "dominant": "floor"
+        }
+      ],
+      [
+        {
+          "walkable": 1.0,
+          "caution": 0.0,
+          "blocked": 0.0,
+          "dominant": "floor"
+        },
+        {
+          "walkable": 1.0,
+          "caution": 0.0,
+          "blocked": 0.0,
+          "dominant": "floor"
+        },
+        {
+          "walkable": 0.0,
+          "caution": 0.0,
+          "blocked": 1.0,
+          "dominant": "obstacle"
+        }
+      ]
+    ],
+    "path_clear": true,
+    "suggest": "left",
+    "hazards": [
+      "curb_ahead"
+    ],
+    "mask_w": 64,
+    "mask_h": 48,
+    "mask_png_b64": "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAwCAAAAACEICPDAAAAQklEQVR4nO3UoQoAIAwG4dtAfP/ntRisfxPBcF9cGOPCQJKOKoKRhisNaS61C7ABNuCHBvkfRPPNBe0CbIAN+KHBBimBAUg2Cjz8AAAAAElFTkSuQmCC",
+    "latency_ms": 2.6536999998825195
+  },
+  "rle": {
+    "w": 64,
+    "h": 48,
+    "classes": [
+      "other",
+      "floor",
+      "sidewalk",
+      "road",
+      "crosswalk",
+      "stairs",
+      "curb",
+      "terrain",
+      "obstacle"
+    ],
+    "ratios": {
+      "other": 0.3333333333333333,
+      "floor": 0.4427083333333333,
+      "sidewalk": 0.0,
+      "road": 0.0,
+      "crosswalk": 0.0,
+      "stairs": 0.0,
+      "curb": 0.109375,
+      "terrain": 0.0,
+      "obstacle": 0.11458333333333333
+    },
+    "grid": [
+      [
+        {
+          "walkable": 0.0,
+          "caution": 0.0,
+          "blocked": 1.0,
+          "dominant": "other"
+        },
+        {
+          "walkable": 0.0,
+          "caution": 0.0,
+          "blocked": 1.0,
+          "dominant": "other"
+        },
+        {
+          "walkable": 0.0,
+          "caution": 0.0,
+          "blocked": 1.0,
+          "dominant": "other"
+        }
+      ],
+      [
+        {
+          "walkable": 1.0,
+          "caution": 0.0,
+          "blocked": 0.0,
+          "dominant": "floor"
+        },
+        {
+          "walkable": 0.0,
+          "caution": 1.0,
+          "blocked": 0.0,
+          "dominant": "curb"
+        },
+        {
+          "walkable": 1.0,
+          "caution": 0.0,
+          "blocked": 0.0,
+          "dominant": "floor"
+        }
+      ],
+      [
+        {
+          "walkable": 1.0,
+          "caution": 0.0,
+          "blocked": 0.0,
+          "dominant": "floor"
+        },
+        {
+          "walkable": 1.0,
+          "caution": 0.0,
+          "blocked": 0.0,
+          "dominant": "floor"
+        },
+        {
+          "walkable": 0.0,
+          "caution": 0.0,
+          "blocked": 1.0,
+          "dominant": "obstacle"
+        }
+      ]
+    ],
+    "path_clear": true,
+    "suggest": "left",
+    "hazards": [
+      "curb_ahead"
+    ],
+    "mask_w": 64,
+    "mask_h": 48,
+    "mask_rle": {
+      "size": [
+        48,
+        64
+      ],
+      "order": "C",
+      "values": [
+        0,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        6,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8,
+        1,
+        8
+      ],
+      "counts": [
+        1024,
+        21,
+        21,
+        43,
+        21,
+        43,
+        21,
+        43,
+        21,
+        43,
+        21,
+        43,
+        21,
+        43,
+        21,
+        43,
+        21,
+        43,
+        21,
+        43,
+        21,
+        43,
+        21,
+        43,
+        21,
+        43,
+        21,
+        43,
+        21,
+        43,
+        21,
+        43,
+        21,
+        64,
+        22,
+        42,
+        22,
+        42,
+        22,
+        42,
+        22,
+        42,
+        22,
+        42,
+        22,
+        42,
+        22,
+        42,
+        22,
+        42,
+        22,
+        42,
+        22,
+        42,
+        22,
+        42,
+        22,
+        42,
+        22,
+        42,
+        22,
+        42,
+        22,
+        42,
+        22
+      ]
+    },
+    "latency_ms": 2.4554000001444365
+  }
+}

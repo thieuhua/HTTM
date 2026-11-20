@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:convert';
+import 'dart:developer' as developer;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/services.dart';
@@ -23,6 +25,10 @@ import '../services/voice_service.dart';
 import '../services/voice_command_router.dart';
 import '../services/assistant_service.dart';
 import '../services/situation_engine.dart';
+import '../services/object_tracker.dart';
+import '../services/risk_assessment_service.dart';
+import '../services/segmentation_service.dart';
+import '../services/walkable_guidance.dart';
 import '../models/assistant_state.dart';
 import 'assistant_controller.dart';
 
@@ -38,6 +44,7 @@ class SessionController {
     TtsService? ttsService,
     GeocodingService? geocodingService,
     AiAssistantService? assistantService,
+    SegmentationService? segmentationService,
     DateTime Function()? now,
   }) : _frameSource = frameSource ?? FrameSource(),
        _detectionService =
@@ -53,6 +60,7 @@ class SessionController {
        _ttsService = ttsService ?? TtsService(),
        _geocodingService = geocodingService ?? GeocodingService(),
        _assistantService = assistantService ?? AiAssistantService(),
+       _segmentationService = segmentationService ?? SegmentationService(),
        _now = now ?? DateTime.now;
 
   final DateTime Function() _now;
@@ -65,12 +73,20 @@ class SessionController {
   final TtsService _ttsService;
   final GeocodingService _geocodingService;
   final AiAssistantService _assistantService;
+  final SegmentationService _segmentationService;
+  final _walkableGuidance = WalkableGuidance();
+  bool _segmentInProgress = false, _segmentOutageAnnounced = false;
+  DateTime? _lastSegmentAt, _segmentRetryAt, _lastYoloWarningAt;
   List<DetectedObject> _latestObjects = const [];
   DateTime? _yoloAt;
   DateTime? _lastPerceptionFailureAt;
   Uint8List? _latestJpeg;
   DateTime? _jpegAt;
   final _situationEngine = SituationEngine();
+  final _tracker = ObjectTracker();
+  final _riskAssessment = RiskAssessmentService();
+  final Map<String, DateTime> _obstacleSpokenAt = {};
+  DateTime? _emptySince;
   late final AssistantController assistant = AssistantController(
     service: _assistantService,
     situationEngine: _situationEngine,
@@ -108,9 +124,9 @@ class SessionController {
   StreamSubscription<RouteInstruction>? _routeSubscription;
   bool _running = false;
   bool _requestInProgress = false;
+  bool _detectorInProgress = false;
   DateTime? _lastSpokenAt;
   DangerLevel? _lastSpokenDanger;
-  int _emptyCycles = 0;
   bool _wasDangerous = false;
   RouteInstruction? _lastRoute;
   final Map<String, RouteInstruction> _pendingRouteSpeech = {};
@@ -148,6 +164,8 @@ class SessionController {
   int _speechEpoch = 0;
   String? ttsError;
   int _perceptionEpoch = 0;
+  final _perceptionClock = Stopwatch()..start();
+  int? _lastDetectionMicros;
   int _navigationLifecycle = 0;
   String? lastUtterance;
   VoiceCommandKind? lastCommandKind;
@@ -606,7 +624,9 @@ class SessionController {
     cameraError = null;
     _stateController.add(const SessionRunning(statusText: 'AI đang chạy'));
     _captureTimer = Timer.periodic(
-      detectionBackend == 'device'
+      _frameSource.usingStream && detectionBackend == 'device'
+          ? const Duration(milliseconds: 100)
+          : detectionBackend == 'device'
           ? AiConfig.deviceCaptureInterval
           : AiConfig.captureInterval,
       (_) => _captureAndDetect(),
@@ -634,6 +654,15 @@ class SessionController {
   }
 
   void stop() {
+    _segmentationService.cancelPending();
+    _walkableGuidance.reset();
+    _lastSegmentAt = _segmentRetryAt = _lastYoloWarningAt = null;
+    _segmentOutageAnnounced = false;
+    _emptySince = null;
+    _obstacleSpokenAt.clear();
+    _tracker.reset();
+    _lastObstacleKey = null;
+    _lastDetectionMicros = null;
     ++_perceptionEpoch;
     _detectorRetryTimer?.cancel();
     _detectorRetryTimer = null;
@@ -655,13 +684,14 @@ class SessionController {
     if (!_running ||
         _cameraBorrowed ||
         _requestInProgress ||
+        _detectorInProgress ||
         !_frameSource.isReady) {
       return;
     }
     _requestInProgress = true;
     final epoch = _perceptionEpoch;
     final cameraIdle = _cameraIdle = Completer<void>();
-    final startedAt = DateTime.now();
+    final cycleClock = Stopwatch()..start();
     XFile? image;
     try {
       image = await _useCamera<XFile>(
@@ -673,7 +703,8 @@ class SessionController {
           ),
         ),
       );
-      final capturedAt = DateTime.now();
+      final capturedAt = _frameSource.lastCapturedAt ?? _now();
+      final captureMs = cycleClock.elapsedMilliseconds;
       try {
         final jpeg = await image.readAsBytes();
         if (!_disposed && _running && epoch == _perceptionEpoch) {
@@ -686,20 +717,30 @@ class SessionController {
         _jpegAt = null;
       }
       cameraIdle.complete();
-      final result = await _detectionService
-          .detect(image)
-          .timeout(
-            AiConfig.detectTimeout,
-            onTimeout: () => throw AiDetectionException(
-              detectionBackend == 'device'
-                  ? 'Nhận diện trên máy quá thời gian chờ.'
-                  : 'AI Server phản hồi quá thời gian chờ.',
-            ),
-          );
+      // Snapshot the same upload bytes: YOLO owns/deletes the camera file.
+      // Segmentation must not extend that file's lifetime or capture again.
+      if (AiConfig.walkableSegEnabled &&
+          _latestJpeg != null &&
+          _jpegAt == capturedAt) {
+        _maybeSegment(XFile.fromData(_latestJpeg!), capturedAt, epoch);
+      }
+      final detectionClock = Stopwatch()..start();
+      _detectorInProgress = true;
+      final pendingDetection = _detectionService.detect(image).whenComplete(() {
+        _detectorInProgress = false;
+      });
+      final rawResult = await pendingDetection.timeout(
+        AiConfig.detectTimeout,
+        onTimeout: () => throw AiDetectionException(
+          detectionBackend == 'device'
+              ? 'Nhận diện trên máy quá thời gian chờ.'
+              : 'AI Server phản hồi quá thời gian chờ.',
+        ),
+      );
       if (_disposed || !_running || epoch != _perceptionEpoch) return;
       if (!SituationEngine.fresh(
         capturedAt,
-        DateTime.now(),
+        _now(),
         SituationEngine.detectionTtl,
       )) {
         _latestObjects = const [];
@@ -710,24 +751,51 @@ class SessionController {
         return;
       }
       cameraError = null;
+      final tracked = _tracker.update(
+        rawResult,
+        capturedAt,
+        _now(),
+        source:
+            '$detectionBackend:${rawResult.model ?? 'unknown'}:${cameraController?.value.deviceOrientation}',
+      );
+      final result = DetectionResult(
+        imageWidth: rawResult.imageWidth,
+        imageHeight: rawResult.imageHeight,
+        objects: tracked,
+        model: rawResult.model,
+        runtime: rawResult.runtime,
+        inferenceMs: rawResult.inferenceMs,
+      );
       _latestObjects = result.objects;
       _yoloAt = capturedAt;
-      _situationEngine.observeDetections(
-        result.objects,
-        capturedAt,
-        DateTime.now(),
+      _situationEngine.observeDetections(result.objects, capturedAt, _now());
+      final completedMicros = _perceptionClock.elapsedMicroseconds;
+      final previousMicros = _lastDetectionMicros;
+      _lastDetectionMicros = completedMicros;
+      final frame = PerceptionFrame(
+        objects: result.objects,
+        imageWidth: result.imageWidth,
+        imageHeight: result.imageHeight,
+        fps: previousMicros == null || completedMicros <= previousMicros
+            ? 0
+            : 1000000 / (completedMicros - previousMicros),
+        latencyMs: cycleClock.elapsedMilliseconds,
+        captureMs: captureMs,
+        detectionMs: detectionClock.elapsedMilliseconds,
+        inferenceMs: result.inferenceMs,
+        capturedAt: capturedAt,
+        backend: detectionBackend,
+        model:
+            result.model ??
+            (detectionBackend == 'device'
+                ? AiConfig.deviceModel
+                : 'unknown (server metadata unavailable)'),
+        runtime: result.runtime ?? 'unknown',
       );
-      final latencyMs = DateTime.now().difference(startedAt).inMilliseconds;
-      final fps = latencyMs > 0 ? 1000 / latencyMs : 0.0;
-      _frameController.add(
-        PerceptionFrame(
-          objects: result.objects,
-          imageWidth: result.imageWidth,
-          imageHeight: result.imageHeight,
-          fps: fps,
-          latencyMs: latencyMs,
-        ),
-      );
+      _frameController.add(frame);
+      if (const bool.fromEnvironment('DETECTION_DEBUG')) {
+        developer.log(jsonEncode(frame.toJson()), name: 'DetectionV2');
+      }
       await _processResult(result, epoch);
     } on CameraException {
       if (_running && epoch == _perceptionEpoch) {
@@ -762,13 +830,114 @@ class SessionController {
     }
   }
 
+  bool _segmentCurrent(int epoch) =>
+      !_disposed && _running && epoch == _perceptionEpoch;
+
+  bool get _segmentCanSpeak =>
+      !_isListening &&
+      _pendingDestination == null &&
+      (_lastSpokenAt == null ||
+          _now().difference(_lastSpokenAt!) >= AiConfig.obstacleSpeechGap);
+
+  void _maybeSegment(XFile image, DateTime capturedAt, int epoch) {
+    final now = _now();
+    if (!AiConfig.walkableSegEnabled ||
+        !_segmentCurrent(epoch) ||
+        _segmentInProgress ||
+        (_lastSegmentAt != null &&
+            now.difference(_lastSegmentAt!) < AiConfig.segmentInterval) ||
+        (_segmentRetryAt != null && now.isBefore(_segmentRetryAt!))) {
+      return;
+    }
+    _segmentInProgress = true;
+    _lastSegmentAt = now;
+    unawaited(_runSegment(image, capturedAt, epoch));
+  }
+
+  Future<void> _runSegment(XFile image, DateTime capturedAt, int epoch) async {
+    try {
+      final result = await _segmentationService.segment(image);
+      if (!_segmentCurrent(epoch)) return;
+      if (!SituationEngine.fresh(
+        capturedAt,
+        _now(),
+        SituationEngine.detectionTtl,
+      )) {
+        _walkableGuidance.reset(cooldowns: false);
+        return;
+      }
+      _segmentRetryAt = null;
+      _segmentOutageAnnounced = false;
+      final hint = _walkableGuidance.update(
+        result,
+        _now(),
+        allowOutput: _segmentCanSpeak,
+        yoloWarnedRecently:
+            _lastYoloWarningAt != null &&
+            _now().difference(_lastYoloWarningAt!) < AiConfig.warningCooldown,
+      );
+      if (hint == null) return;
+      final yoloWarningAt = _lastYoloWarningAt;
+      if (hint.haptic == WalkableHaptic.medium) {
+        try {
+          await HapticFeedback.mediumImpact();
+        } catch (_) {}
+      }
+      // Re-check after the await: YOLO or the user may have taken the floor.
+      // The shared gap is only claimed once a hint is actually spoken, and
+      // YOLO's _lastSpokenDanger is never touched by advisory seg speech.
+      if (!_segmentCurrent(epoch) ||
+          !_segmentCanContinueSpeech(capturedAt) ||
+          !_segmentCanSpeak ||
+          _lastYoloWarningAt != yoloWarningAt) {
+        return;
+      }
+      if (await _speak(hint.text, priority: hint.priority)) {
+        _lastSpokenAt = _now();
+      }
+    } on SegmentationBusyException {
+      // Server still busy with the previous frame: keep hysteresis, no backoff.
+    } catch (_) {
+      if (!_segmentCurrent(epoch)) return;
+      _walkableGuidance.reset(cooldowns: false);
+      _segmentRetryAt = _now().add(AiConfig.detectorRetryInterval);
+      if (!_segmentOutageAnnounced && _segmentCanSpeak) {
+        _segmentOutageAnnounced = true;
+        if (await _speak('Phân vùng lối đi tạm tắt', priority: 2)) {
+          _lastSpokenAt = _now();
+        }
+      }
+    } finally {
+      _segmentInProgress = false;
+    }
+  }
+
+  bool _segmentCanContinueSpeech(DateTime capturedAt) =>
+      !_isListening &&
+      _pendingDestination == null &&
+      SituationEngine.fresh(capturedAt, _now(), SituationEngine.detectionTtl);
+
   Future<void> _processResult(DetectionResult result, int epoch) async {
-    final warning = _reasoningService.selectWarning(result.objects);
+    final candidates = _riskAssessment.candidates(result.objects, _now());
+    if (result.objects.isNotEmpty && candidates.isEmpty) {
+      _emptySince = null;
+      _stateController.add(
+        const SessionRunning(
+          statusText: 'Camera đang kiểm tra đối tượng qua nhiều khung hình.',
+        ),
+      );
+      return;
+    }
+    final warning = _reasoningService.selectWarning(
+      candidates,
+      priority: _riskAssessment.priority,
+    );
     final routeText = _lastRoute?.text;
 
     if (warning == null) {
-      _emptyCycles++;
-      if (_emptyCycles >= AiConfig.safeCyclesRequired) {
+      _emptySince ??= _now();
+      if (_now().difference(_emptySince!) >=
+          RiskAssessmentService.emptyObservationHold) {
         final shouldSpeakSafe = _wasDangerous;
         _wasDangerous = false;
         _stateController.add(
@@ -797,7 +966,7 @@ class SessionController {
       return;
     }
 
-    _emptyCycles = 0;
+    _emptySince = null;
     _wasDangerous = true;
     final decisionSource = routeText == null
         ? 'Camera: đối tượng ở ${_positionLabel(warning.object.position)} khung hình'
@@ -816,17 +985,26 @@ class SessionController {
     // objects and would otherwise look new on almost every frame.
     final key =
         '${warning.object.className}:${warning.object.position}:${warning.danger.name}';
+    final trackKey =
+        '${warning.object.trackId ?? warning.object.className}:${warning.object.position}:${warning.danger.name}';
+    _obstacleSpokenAt.removeWhere(
+      (_, at) => now.difference(at) >= AiConfig.warningCooldown,
+    );
+    final repeated =
+        _obstacleSpokenAt.containsKey(key) ||
+        _obstacleSpokenAt.containsKey(trackKey);
     final sinceSpoken = _lastSpokenAt == null
         ? null
         : now.difference(_lastSpokenAt!);
     final coolingDown =
         sinceSpoken != null &&
-        (sinceSpoken < AiConfig.obstacleSpeechGap ||
-            (_lastObstacleKey == key &&
-                sinceSpoken < AiConfig.warningCooldown));
+        (sinceSpoken < AiConfig.obstacleSpeechGap || repeated);
     final canInterrupt =
         warning.danger == DangerLevel.high &&
-        _lastSpokenDanger != DangerLevel.high;
+        (_lastSpokenDanger != DangerLevel.high ||
+            (!repeated &&
+                warning.object.position == 'center' &&
+                _lastObstacleKey != key));
     // Small objects off to the side are shown but not spoken.
     final minorSide =
         warning.danger == DangerLevel.low &&
@@ -854,13 +1032,18 @@ class SessionController {
       )) {
         _obstacleUntil = DateTime.now().add(AiConfig.obstacleSpeechHold);
         _lastObstacleKey = key;
+        _lastYoloWarningAt = now;
         _lastSpokenAt = now;
         _lastSpokenDanger = warning.danger;
+        _obstacleSpokenAt[key] = now;
+        _obstacleSpokenAt[trackKey] = now;
       }
     }
   }
 
   void _perceptionUnavailable() {
+    _emptySince = null;
+    _tracker.reset();
     _latestObjects = const [];
     _yoloAt = null;
     _situationEngine.sensorUnavailable(DateTime.now());
@@ -1195,6 +1378,8 @@ class SessionController {
     _detectorRetryTimer?.cancel();
     _routeSpeechTimer?.cancel();
     _captureTimer?.cancel();
+    // Release seg synchronously: its requests must not outlive the session.
+    _segmentationService.dispose();
     await assistant.dispose();
     await _routeSubscription?.cancel();
     await _routeService.dispose();
