@@ -27,6 +27,8 @@ import '../services/assistant_service.dart';
 import '../services/situation_engine.dart';
 import '../services/object_tracker.dart';
 import '../services/risk_assessment_service.dart';
+import '../services/segmentation_service.dart';
+import '../services/walkable_guidance.dart';
 import '../models/assistant_state.dart';
 import 'assistant_controller.dart';
 
@@ -42,6 +44,7 @@ class SessionController {
     TtsService? ttsService,
     GeocodingService? geocodingService,
     AiAssistantService? assistantService,
+    SegmentationService? segmentationService,
     DateTime Function()? now,
   }) : _frameSource = frameSource ?? FrameSource(),
        _detectionService =
@@ -57,6 +60,7 @@ class SessionController {
        _ttsService = ttsService ?? TtsService(),
        _geocodingService = geocodingService ?? GeocodingService(),
        _assistantService = assistantService ?? AiAssistantService(),
+       _segmentationService = segmentationService ?? SegmentationService(),
        _now = now ?? DateTime.now;
 
   final DateTime Function() _now;
@@ -69,6 +73,10 @@ class SessionController {
   final TtsService _ttsService;
   final GeocodingService _geocodingService;
   final AiAssistantService _assistantService;
+  final SegmentationService _segmentationService;
+  final _walkableGuidance = WalkableGuidance();
+  bool _segmentInProgress = false, _segmentOutageAnnounced = false;
+  DateTime? _lastSegmentAt, _segmentRetryAt, _lastYoloWarningAt;
   List<DetectedObject> _latestObjects = const [];
   DateTime? _yoloAt;
   DateTime? _lastPerceptionFailureAt;
@@ -646,6 +654,10 @@ class SessionController {
   }
 
   void stop() {
+    _segmentationService.cancelPending();
+    _walkableGuidance.reset();
+    _lastSegmentAt = _segmentRetryAt = _lastYoloWarningAt = null;
+    _segmentOutageAnnounced = false;
     _emptySince = null;
     _obstacleSpokenAt.clear();
     _tracker.reset();
@@ -705,6 +717,13 @@ class SessionController {
         _jpegAt = null;
       }
       cameraIdle.complete();
+      // Snapshot the same upload bytes: YOLO owns/deletes the camera file.
+      // Segmentation must not extend that file's lifetime or capture again.
+      if (AiConfig.walkableSegEnabled &&
+          _latestJpeg != null &&
+          _jpegAt == capturedAt) {
+        _maybeSegment(XFile.fromData(_latestJpeg!), capturedAt, epoch);
+      }
       final detectionClock = Stopwatch()..start();
       _detectorInProgress = true;
       final pendingDetection = _detectionService.detect(image).whenComplete(() {
@@ -810,6 +829,93 @@ class SessionController {
       }
     }
   }
+
+  bool _segmentCurrent(int epoch) =>
+      !_disposed && _running && epoch == _perceptionEpoch;
+
+  bool get _segmentCanSpeak =>
+      !_isListening &&
+      _pendingDestination == null &&
+      (_lastSpokenAt == null ||
+          _now().difference(_lastSpokenAt!) >= AiConfig.obstacleSpeechGap);
+
+  void _maybeSegment(XFile image, DateTime capturedAt, int epoch) {
+    final now = _now();
+    if (!AiConfig.walkableSegEnabled ||
+        !_segmentCurrent(epoch) ||
+        _segmentInProgress ||
+        (_lastSegmentAt != null &&
+            now.difference(_lastSegmentAt!) < AiConfig.segmentInterval) ||
+        (_segmentRetryAt != null && now.isBefore(_segmentRetryAt!))) {
+      return;
+    }
+    _segmentInProgress = true;
+    _lastSegmentAt = now;
+    unawaited(_runSegment(image, capturedAt, epoch));
+  }
+
+  Future<void> _runSegment(XFile image, DateTime capturedAt, int epoch) async {
+    try {
+      final result = await _segmentationService.segment(image);
+      if (!_segmentCurrent(epoch)) return;
+      if (!SituationEngine.fresh(
+        capturedAt,
+        _now(),
+        SituationEngine.detectionTtl,
+      )) {
+        _walkableGuidance.reset(cooldowns: false);
+        return;
+      }
+      _segmentRetryAt = null;
+      _segmentOutageAnnounced = false;
+      final hint = _walkableGuidance.update(
+        result,
+        _now(),
+        allowOutput: _segmentCanSpeak,
+        yoloWarnedRecently:
+            _lastYoloWarningAt != null &&
+            _now().difference(_lastYoloWarningAt!) < AiConfig.warningCooldown,
+      );
+      if (hint == null) return;
+      final yoloWarningAt = _lastYoloWarningAt;
+      if (hint.haptic == WalkableHaptic.medium) {
+        try {
+          await HapticFeedback.mediumImpact();
+        } catch (_) {}
+      }
+      // Re-check after the await: YOLO or the user may have taken the floor.
+      // The shared gap is only claimed once a hint is actually spoken, and
+      // YOLO's _lastSpokenDanger is never touched by advisory seg speech.
+      if (!_segmentCurrent(epoch) ||
+          !_segmentCanContinueSpeech(capturedAt) ||
+          !_segmentCanSpeak ||
+          _lastYoloWarningAt != yoloWarningAt) {
+        return;
+      }
+      if (await _speak(hint.text, priority: hint.priority)) {
+        _lastSpokenAt = _now();
+      }
+    } on SegmentationBusyException {
+      // Server still busy with the previous frame: keep hysteresis, no backoff.
+    } catch (_) {
+      if (!_segmentCurrent(epoch)) return;
+      _walkableGuidance.reset(cooldowns: false);
+      _segmentRetryAt = _now().add(AiConfig.detectorRetryInterval);
+      if (!_segmentOutageAnnounced && _segmentCanSpeak) {
+        _segmentOutageAnnounced = true;
+        if (await _speak('Phân vùng lối đi tạm tắt', priority: 2)) {
+          _lastSpokenAt = _now();
+        }
+      }
+    } finally {
+      _segmentInProgress = false;
+    }
+  }
+
+  bool _segmentCanContinueSpeech(DateTime capturedAt) =>
+      !_isListening &&
+      _pendingDestination == null &&
+      SituationEngine.fresh(capturedAt, _now(), SituationEngine.detectionTtl);
 
   Future<void> _processResult(DetectionResult result, int epoch) async {
     final candidates = _riskAssessment.candidates(result.objects, _now());
@@ -926,6 +1032,7 @@ class SessionController {
       )) {
         _obstacleUntil = DateTime.now().add(AiConfig.obstacleSpeechHold);
         _lastObstacleKey = key;
+        _lastYoloWarningAt = now;
         _lastSpokenAt = now;
         _lastSpokenDanger = warning.danger;
         _obstacleSpokenAt[key] = now;
@@ -1271,6 +1378,8 @@ class SessionController {
     _detectorRetryTimer?.cancel();
     _routeSpeechTimer?.cancel();
     _captureTimer?.cancel();
+    // Release seg synchronously: its requests must not outlive the session.
+    _segmentationService.dispose();
     await assistant.dispose();
     await _routeSubscription?.cancel();
     await _routeService.dispose();

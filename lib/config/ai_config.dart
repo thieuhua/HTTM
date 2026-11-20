@@ -70,6 +70,16 @@ class AiConfig {
   }
 
   static const deviceCaptureInterval = Duration(milliseconds: 500);
+  static bool get walkableSegEnabled {
+    const override = String.fromEnvironment('WALKABLE_SEG');
+    final value = override.isNotEmpty
+        ? override
+        : (dotenv.isInitialized ? dotenv.env['WALKABLE_SEG'] : null);
+    return value?.trim().toLowerCase() == 'true';
+  }
+
+  static const segmentTimeout = Duration(seconds: 4);
+  static const segmentInterval = Duration(milliseconds: 1800);
   static const Duration captureInterval = Duration(milliseconds: 900);
   static const Duration requestTimeout = Duration(seconds: 20);
   static const Duration detectTimeout = Duration(seconds: 4);

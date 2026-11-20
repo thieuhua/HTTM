@@ -240,6 +240,13 @@ bạn thay vì phụ thuộc endpoint mặc định trong mã.
 | `httm_yolo11n_ft20.tflite` | Model tùy biến 10 lớp, lựa chọn mặc định |
 | `yolo11n.tflite` | Model COCO để đối chiếu; app giữ các lớp vật cản được ánh xạ |
 
+`WALKABLE_SEG=true` (dart-define hoặc `.env`, mặc định tắt) bật phân vùng lối đi qua
+`POST /segment` của server: chạy song song YOLO trên cùng frame, khoảng 1,8 giây/lần,
+lỗi hoặc worker tắt chỉ làm tắt phân vùng (báo "Phân vùng lối đi tạm tắt" một lần),
+không ảnh hưởng cảnh báo vật cản. Câu nói chỉ là gợi ý (bờ vỉa, lòng đường, vạch qua
+đường, hướng trống hơn, dừng lại kiểm tra); lớp cầu thang yếu nên **không** dùng để cảnh
+báo cầu thang. Xem [docs/HANDOFF_WALKABLE_SEG.md](docs/HANDOFF_WALKABLE_SEG.md).
+
 `DEVICE_MODEL` chỉ nhận tên file `.tflite`, không nhận đường dẫn. Mọi file model
 trong thư mục assets này đều được đóng gói vào app. Hướng dẫn xuất file nằm tại
 [assets/models/README.md](assets/models/README.md).
