@@ -14,6 +14,8 @@ import numpy as np
 from dotenv import dotenv_values
 from PIL import Image
 
+from colab_inference import build_remote_worker
+
 
 logger = logging.getLogger("smart-navigation")
 SERVER_DIR = Path(__file__).resolve().parent
@@ -74,6 +76,7 @@ CLASS_ALIASES: dict[str, str] = {
     "trash_bin": "trash_bin",
     "trash bin": "trash_bin",
     "signboard": "signboard",
+    "traffic light": "traffic_light",
 }
 
 
@@ -167,6 +170,26 @@ class YoloObstacleDetector:
             raise ValueError("YOLO confidence/IoU must be finite probabilities in (0, 1]")
         if self.image_size is not None and (self.image_size < 32 or self.image_size > 1920 or self.image_size % 32):
             raise ValueError("YOLO_IMGSZ must be a multiple of 32 in [32, 1920]")
+        self._source = threading.local()
+        self._remote = build_remote_worker(
+            detector_setting("COLAB_WORKER_URL", ""),
+            lambda name: canonical_class_name(name) is not None,
+        )
+
+    def start_remote(self) -> None:
+        if self._remote is not None:
+            self._remote.start()
+
+    def stop_remote(self) -> None:
+        if self._remote is not None:
+            self._remote.stop()
+
+    def last_source(self) -> dict[str, str]:
+        """Where the current thread's latest detect() call ran."""
+        return getattr(self._source, "value", None) or self._local_source()
+
+    def _local_source(self) -> dict[str, str]:
+        return {"source": "local", "model": Path(self.model_name).name, "runtime": "ultralytics/cpu"}
 
     def _predict_options(self) -> dict[str, Any]:
         options: dict[str, Any] = {"conf": self.confidence, "verbose": False, "device": "cpu"}
@@ -225,8 +248,20 @@ class YoloObstacleDetector:
     def detect(self, image: Image.Image) -> list[dict[str, Any]]:
         rgb_image = image.convert("RGB")
         image_width, image_height = rgb_image.size
-        image_area = image_width * image_height
 
+        remote = self._remote.infer(rgb_image) if self._remote is not None else None
+        if remote is not None:
+            self._source.value = {"source": "colab", "model": remote.model, "runtime": remote.runtime}
+            objects = []
+            for box in remote.boxes:
+                if box.confidence < self.confidence:
+                    continue
+                item = self._build_object(box.class_name, box.confidence, box.xyxy, image_width, image_height)
+                if item is not None:
+                    objects.append(item)
+            return objects
+
+        self._source.value = self._local_source()
         with self._inference_lock:
             results = self._get_model().predict(
                 # Ultralytics interprets PIL as RGB, numpy as BGR. Passing an
@@ -245,46 +280,60 @@ class YoloObstacleDetector:
             self._log_model_classes(names)
             self._logged_model_id = id(self._model)
         for box in result.boxes:
-            class_id = int(box.cls.item())
-            model_class_name = str(names[class_id])
-            class_name = canonical_class_name(model_class_name)
-            if class_name is None:
-                continue
-
-            x1, y1, x2, y2 = (float(value) for value in box.xyxy[0].tolist())
-            center_x = (x1 + x2) / 2
-            center_y = (y1 + y2) / 2
-            box_width = max(0.0, x2 - x1)
-            box_height = max(0.0, y2 - y1)
-            area_ratio = (box_width * box_height) / image_area
-            position = position_for(center_x, image_width)
-            danger = danger_for(
-                area_ratio,
-                class_name=class_name,
-                position=position,
-                bottom_ratio=y2 / image_height,
+            item = self._build_object(
+                str(names[int(box.cls.item())]),
+                float(box.conf.item()),
+                tuple(float(value) for value in box.xyxy[0].tolist()),
+                image_width,
+                image_height,
             )
-
-            objects.append(
-                {
-                    "class_name": class_name,
-                    "model_class_name": model_class_name,
-                    "confidence": round(float(box.conf.item()), 4),
-                    "x1": round(x1, 2),
-                    "y1": round(y1, 2),
-                    "x2": round(x2, 2),
-                    "y2": round(y2, 2),
-                    "center_x": round(center_x, 2),
-                    "center_y": round(center_y, 2),
-                    "width_ratio": round(box_width / image_width, 4),
-                    "height_ratio": round(box_height / image_height, 4),
-                    "area_ratio": round(area_ratio, 4),
-                    "position": position,
-                    "danger": danger,
-                }
-            )
+            if item is not None:
+                objects.append(item)
 
         return objects
+
+    @staticmethod
+    def _build_object(
+        model_class_name: str,
+        confidence: float,
+        xyxy: tuple[float, ...],
+        image_width: int,
+        image_height: int,
+    ) -> dict[str, Any] | None:
+        """The one response shape the app reads, shared by the local and Colab paths."""
+        class_name = canonical_class_name(model_class_name)
+        if class_name is None:
+            return None
+
+        x1, y1, x2, y2 = xyxy
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        box_width = max(0.0, x2 - x1)
+        box_height = max(0.0, y2 - y1)
+        area_ratio = (box_width * box_height) / (image_width * image_height)
+        position = position_for(center_x, image_width)
+        danger = danger_for(
+            area_ratio,
+            class_name=class_name,
+            position=position,
+            bottom_ratio=y2 / image_height,
+        )
+        return {
+            "class_name": class_name,
+            "model_class_name": model_class_name,
+            "confidence": round(confidence, 4),
+            "x1": round(x1, 2),
+            "y1": round(y1, 2),
+            "x2": round(x2, 2),
+            "y2": round(y2, 2),
+            "center_x": round(center_x, 2),
+            "center_y": round(center_y, 2),
+            "width_ratio": round(box_width / image_width, 4),
+            "height_ratio": round(box_height / image_height, 4),
+            "area_ratio": round(area_ratio, 4),
+            "position": position,
+            "danger": danger,
+        }
 
 
 # Integration boundary: measured metric depth/tracking need their own validated

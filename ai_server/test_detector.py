@@ -94,6 +94,10 @@ class HeuristicTests(unittest.TestCase):
             with self.subTest(index=index, raw=case["class_name_raw"]):
                 name = canonical_class_name(case["class_name_raw"])
                 expected = case["expected"]
+                if case["class_name_raw"] in {"traffic_light", "traffic light"}:
+                    # Server-only alias for COCO models; the on-device rules still ignore this name.
+                    self.assertEqual(name, "traffic_light")
+                    continue
                 if expected is None:
                     self.assertIsNone(name)
                     continue
@@ -135,8 +139,9 @@ class HeuristicTests(unittest.TestCase):
             self.assertEqual(canonical_class_name(raw), canonical)
             self.assertIn(canonical, OBSTACLE_CLASSES)
 
-        # COCO traffic light (with space) must not be added so old COCO behavior is unchanged.
-        self.assertIsNone(canonical_class_name("traffic light"))
+        # COCO names this class with a space; both spellings reach the same obstacle class.
+        self.assertEqual(canonical_class_name("traffic light"), "traffic_light")
+        self.assertEqual(canonical_class_name("traffic_light"), "traffic_light")
         self.assertIsNone(canonical_class_name("airplane"))
 
     def test_fake_model_maps_httm_classes_and_preserves_model_class_name(self) -> None:
@@ -197,8 +202,8 @@ class HeuristicTests(unittest.TestCase):
             det.detect(Image.new("RGB", (100, 100)))
 
         self.assertEqual(len(logs.output), 1)
-        self.assertEqual([o["class_name"] for o in objects], ["person", "car"])
-        self.assertEqual([o["model_class_name"] for o in objects], ["person", "car"])
+        self.assertEqual([o["class_name"] for o in objects], ["person", "car", "traffic_light"])
+        self.assertEqual([o["model_class_name"] for o in objects], ["person", "car", "traffic light"])
 
     def test_logs_error_when_no_model_classes_map(self) -> None:
         det = YoloObstacleDetector()

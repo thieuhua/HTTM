@@ -41,7 +41,15 @@ async def lifespan(_app: FastAPI):
     # deadline, so do it before the first frame arrives instead of on it.
     if os.getenv("YOLO_PRELOAD", "1") != "0":
         threading.Thread(target=detector.warm_up, name="yolo-preload", daemon=True).start()
+    detector.start_remote()
     yield
+    detector.stop_remote()
+
+
+def run_detection(image: Image.Image) -> tuple[list[dict[str, object]], dict[str, str]]:
+    # last_source() is per thread, so read it on the worker thread that ran detect().
+    objects = detector.detect(image)
+    return objects, detector.last_source()
 
 
 app = FastAPI(title="Smart Navigation AI Server", version="2.0.0", lifespan=lifespan)
@@ -120,7 +128,7 @@ async def detect(image: UploadFile = File(...), diagnostics: bool = False) -> di
     width, height = pil_image.size
     started = time.perf_counter()
     try:
-        objects = await run_in_threadpool(detector.detect, pil_image)
+        objects, source = await run_in_threadpool(run_detection, pil_image)
     except Exception as error:
         logger.exception("YOLO inference failed")
         raise HTTPException(status_code=500, detail="Object detection failed.") from error
@@ -133,8 +141,9 @@ async def detect(image: UploadFile = File(...), diagnostics: bool = False) -> di
     }
     if diagnostics:
         response["diagnostics"] = {
-            "model": Path(detector.model_name).name,
-            "runtime": "ultralytics/cpu",
+            "model": source["model"],
+            "runtime": source["runtime"],
+            "source": source["source"],
             # Includes threadpool/lock wait, preprocessing, predict and rules.
             "inference_ms": (time.perf_counter() - started) * 1000,
         }
